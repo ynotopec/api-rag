@@ -191,6 +191,47 @@ curl -N http://localhost:8080/v1/chat/completions \
 
 ---
 
+## ✅ Évaluer la qualité du RAG
+
+Ce dépôt fournit un script léger pour mesurer la qualité du RAG **sans dépendances externes**. Le principe : envoyer une liste de questions, vérifier la présence des **sources** renvoyées par l’API, et mesurer si la réponse contient des **mots‑clés attendus**.
+
+### 1) Préparer un dataset JSONL
+
+Chaque ligne contient :
+* `question` : la question utilisateur.
+* `expected_sources` : liste de sources attendues (ex. `README.md`).
+* `expected_keywords` : liste de mots‑clés attendus dans la réponse.
+* `metadata` : optionnel.
+
+Un exemple est fourni : `eval_dataset.sample.jsonl`.
+
+### 2) Lancer l’évaluation
+
+```bash
+python evaluate_rag.py \
+  --dataset eval_dataset.sample.jsonl \
+  --endpoint http://localhost:8080/v1/chat/completions \
+  --model ai-rag \
+  --token my-inbound-token
+```
+
+Le script affiche un résumé JSON avec :
+* `avg_precision` : précision des sources.
+* `avg_recall` : rappel des sources.
+* `avg_keyword_recall` : rappel des mots‑clés.
+
+### 3) Exporter les résultats détaillés
+
+```bash
+python evaluate_rag.py \
+  --dataset eval_dataset.sample.jsonl \
+  --output eval_results.json
+```
+
+> 💡 Astuce : enrichissez le dataset avec vos documents réels (noms de fichiers attendus) pour une mesure fidèle.
+
+---
+
 ## 🔐 Authentification
 
 * **Entrée** : si `API_AUTH_TOKEN` est défini, chaque requête **doit** fournir `Authorization: Bearer <token>`.
