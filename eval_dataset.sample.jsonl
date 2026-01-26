@@ -1,0 +1,3 @@
+{"question": "Quels sont les prérequis pour lancer le serveur ?", "expected_sources": ["README.md"], "expected_keywords": ["Python", "pip"], "metadata": {"topic": "prerequisites"}}
+{"question": "Quelles variables d'environnement configurent le RAG ?", "expected_sources": ["README.md"], "expected_keywords": ["RAG_TOP_K", "RAG_QUERY_STRATEGY"], "metadata": {"topic": "env"}}
+{"question": "Quel est le port par défaut du serveur ?", "expected_sources": ["README.md"], "expected_keywords": ["8080"], "metadata": {"topic": "port"}}
