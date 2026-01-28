@@ -2,7 +2,7 @@
 
 Un serveur **FastAPI** exposant une API **compatible OpenAI** (`/v1/chat/completions`) dédiée au **RAG conversationnel** (retrieval‑augmented generation) basé sur **FAISS** + **HuggingFace embeddings**.
 
-> Fichier principal : `app.py` — Version API : **1.2.1**
+> Fichier principal : `app.py` — Version API : **2.1.0**
 
 ---
 
@@ -11,25 +11,25 @@ Un serveur **FastAPI** exposant une API **compatible OpenAI** (`/v1/chat/complet
 * **Compatibilité OpenAI**: accepte les payloads `chat/completions` standards
 * **Modèle logique unique** exposé : `ai-rag`
 * **RAG conversationnel** avec stratégie **rewrite + HyDE** (configurable)
-* **FAISS** persistant via `vectorstore.pkl` (auto‑construction si `wiki.txt` est présent)
-* **Réécriture de requête** (FR) et **HyDE** pour améliorer le rappel documentaire
-* **MMR + seuil de similarité** + **déduplication** des chunks
+* **FAISS** persistant via `vectorstore_db/` (auto‑construction si `wiki.txt` est présent)
+* **Réécriture de requête** et **HyDE** (configurables) pour améliorer le rappel documentaire
+* **Fusion RRF + déduplication + reranking** des chunks (optionnels)
 * **Sources** renvoyées dans la réponse (suffixe « Sources: … »)
-* **Streaming SSE** simulé (chunks OpenAI) côté serveur
+* **Streaming SSE** relayé depuis l’amont (chunks OpenAI)
 * **Auth Bearer** optionnelle côté entrée, **clé OpenAI** côté sortie
-* **Patch auto du tokenizer `pad_token`** pour certains embeddings HuggingFace
 
 ---
 
 ## 🧠 Algorithme RAG (vue d’ensemble)
 
 ```text
-[Messages] → (1) Réécriture FR (<=32 mots) → q
-             (2) HyDE (réponse fictive courte) → pseudo
-             (3) Retrieval FAISS
-                 • MMR(k=8, fetch_k=24, λ=0.5) sur q
-                 • Similarity threshold(score≥0.25, k=12) sur pseudo
-             (4) Fusion + déduplication des chunks
+[Messages] → (1) Réécriture → q'
+             (2) HyDE (pseudo‑document) → h
+             (3) Retrieval FAISS (similarity_search)
+                 • q (immédiat)
+                 • q' (si activé)
+                 • h (si activé)
+             (4) Fusion RRF + déduplication (+ reranking)
              (5) Contexte = concat top‑K (K=RAG_TOP_K)
              (6) Prompt vers modèle amont (UPSTREAM_MODEL_RAG)
              (7) Réponse + liste des sources
@@ -49,9 +49,9 @@ flowchart LR
         ensure["Chargement FAISS<br/>(_ensure_vectorstore)"]
         rewrite["Réécriture FR<br/>UPSTREAM_MODEL_REWRITE"]
         hyde["HyDE<br/>pseudo-réponse"]
-        retriever_mmr["Retrieval MMR<br/>(k=8, fetch=24)"]
-        retriever_thresh["Retrieval seuil<br/>(score ≥ 0.25, k=12)"]
-        dedup["Fusion + déduplication"]
+        retriever_mmr["Retrieval similarity_search<br/>(q / q' / h)"]
+        retriever_thresh["Fusion RRF<br/>+ dédup + reranking"]
+        dedup["Sélection top‑K"]
         prompt["Contexte + historique<br/>→ prompt final"]
         rag_call["Appel UPSTREAM_MODEL_RAG"]
         ensure --> rewrite
@@ -66,23 +66,25 @@ flowchart LR
 
     dispatch -->|ai-rag| ensure
     rag_call --> format
-    format --> stream["Streaming SSE simulé<br/>ou JSON"]
+    format --> stream["Streaming SSE relayé<br/>ou JSON"]
     stream --> client
 ```
 
 ### Détails étape par étape
 
-0. **Vectorstore** (`_ensure_vectorstore`) : charge `vectorstore.pkl`, le reconstruit si absent, si `RAG_FORCE_REBUILD=on`, ou si `wiki.txt` est plus récent.
-1. **Fenêtre d’historique** : un extrait de `HISTORY_WINDOW` derniers messages est construit.
-2. **Réécriture** (`_rewrite_query`) : le serveur appelle le LLM amont (param `UPSTREAM_MODEL_REWRITE`) pour produire **une** requête FR autonome (≤ 32 mots), optionnellement préfixée par `RAG_TOPIC_PREFIX`.
-3. **HyDE** (`_hyde_expand`) : on génère une **réponse idéale courte** (FR, ≤ 6 lignes) à partir de la requête réécrite, pour densifier la sémantique lors du retrieval.
-4. **Retrieval** (`_retrieve_with_strategy`) :
+0. **Vectorstore** (`_ensure_vectorstore`) : charge `vectorstore_db/` (index FAISS + `chunks.pkl`), le reconstruit si absent, si `RAG_FORCE_REBUILD=on`, ou si `wiki.txt` est plus récent.
+1. **Historique court** : un extrait des 3 derniers messages précédents est construit pour la réécriture.
+2. **Réécriture** (`_rewrite_query`) : le serveur appelle le LLM amont (param `UPSTREAM_MODEL_REWRITE`) pour produire une requête optimisée.
+3. **HyDE** (`_hyde_expand`) : on génère un pseudo‑document court à partir de la requête utilisateur.
+4. **Retrieval** (`_retrieve_pipeline`) :
 
-   * **MMR** (k=8, fetch\_k=24, λ=0.5) sur la requête réécrite → diversité des chunks.
-   * **Seuil** (score≥0.25, k=12) sur le texte HyDE → chunks très pertinents.
-5. **Déduplication** : on conserve le premier chunk de chaque « signature » calculée sur les 256 premiers caractères.
+   * **Recherche immédiate** sur la requête utilisateur.
+   * **Recherche secondaire** sur la requête réécrite (si activée).
+   * **Recherche HyDE** sur le pseudo‑document (si activée).
+   * **Hybrid BM25** optionnel en complément.
+5. **Fusion & déduplication** : fusion RRF, déduplication (hash + fuzzy match), reranking optionnel.
 6. **Contexte** : concaténation des `RAG_TOP_K` premiers chunks.
-7. **Génération** : on envoie au modèle amont un prompt système prudent + le **contexte** + la **requête utilisateur initiale** (et non la réécriture). Le LLM doit **se limiter** au contexte, sinon indiquer que c’est insuffisant.
+7. **Génération** : on envoie au modèle amont un prompt système + le **contexte** + l’historique récent.
 8. **Sources** : noms de fichiers (métadonnée `source`) déduits des chunks retenus.
 
 > ⚠️ Si aucun chunk pertinent : réponse courte indiquant l’insuffisance du contexte.
@@ -95,9 +97,8 @@ flowchart LR
 * **/v1/chat/completions** : route unique côté client
 * **RAG** : construit un prompt enrichi par le contexte, puis appelle `UPSTREAM_MODEL_RAG`
 * **FAISS** : persistance sur disque ; re‑binding de la fonction d’embedding au chargement
-* **Embeddings** : `OrdalieTech/Solon-embeddings-large-0.1` (HuggingFace)
-* **Auto‑patch tokenizer** : ajoute `pad_token` si manquant (ex. XLMRobertaTokenizerFast)
-* **Rebuild conditionnel** : recharge `vectorstore.pkl` ou le régénère si `wiki.txt` est plus récent ou si `RAG_FORCE_REBUILD` est activé
+* **Embeddings** : `BAAI/bge-m3` (HuggingFace)
+* **Rebuild conditionnel** : recharge `vectorstore_db/` ou le régénère si `wiki.txt` est plus récent ou si `RAG_FORCE_REBUILD` est activé
 
 ---
 
@@ -111,13 +112,16 @@ flowchart LR
 | `UPSTREAM_MODEL_RAG` | `gpt-4o-mini` | Modèle amont pour la génération RAG. |
 | `UPSTREAM_MODEL_REWRITE` | `=UPSTREAM_MODEL_RAG` | Modèle amont pour la réécriture et HyDE. |
 | `MODEL_RAG` | `ai-rag` | Nom logique exposé pour le pipeline RAG. |
-| `VECTORSTORE_PATH` | `vectorstore.pkl` | Chemin du FAISS sérialisé (persisté sur disque). |
+| `VECTORSTORE_DIR` | `vectorstore_db` | Dossier du FAISS sérialisé (persisté sur disque). |
 | `WIKI_TXT` | `wiki.txt` | Corpus brut utilisé pour construire le FAISS si absent. |
 | `RAG_FORCE_REBUILD` | *(vide)* | Si `1/true/on` : force la reconstruction du FAISS au démarrage. |
-| `RAG_TOP_K` | `10` | Nombre max de chunks concaténés dans le contexte. |
-| `RAG_QUERY_STRATEGY` | `rewrite+hyde` | `vanilla`, `rewrite`, `hyde` ou `rewrite+hyde`. |
-| `RAG_HISTORY_WINDOW` | `6` | Nb. de messages conservés pour la réécriture. |
-| `RAG_TOPIC_PREFIX` | *(vide)* | Préfixe thématique forcé (ex. « Kubernetes »). |
+| `RAG_TOP_K` | `8` | Nombre max de chunks concaténés dans le contexte. |
+| `RAG_QUERY_STRATEGY` | `rewrite+hyde` | `simple`, `rewrite`, `hyde` ou `rewrite+hyde`. |
+| `RAG_HISTORY_WINDOW` | `6` | Nb. de messages conservés pour le prompt final. |
+| `ENABLE_HYBRID_SEARCH` | `true` | Active la recherche BM25 hybride. |
+| `ENABLE_RERANKING` | `true` | Active le reranking CrossEncoder. |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | Modèle d’embeddings utilisé. |
+| `BM25_K` | `4` | Nombre de résultats BM25 pris en compte. |
 | `PORT` | `8080` | Port HTTP local. |
 
 ---
@@ -143,7 +147,7 @@ pip install -r requirements.txt
 
 ### Données
 
-* Placez vos contenus dans `wiki.txt` (texte brut). Au premier démarrage sans `vectorstore.pkl`, l’index sera construit et persisté.
+* Placez vos contenus dans `wiki.txt` (texte brut). Au premier démarrage sans `vectorstore_db/`, l’index sera construit et persisté.
 
 ### Lancer le serveur
 
@@ -172,7 +176,7 @@ curl -s http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-### 2) Streaming (SSE simulé côté serveur)
+### 2) Streaming (SSE relayé côté serveur)
 
 ```bash
 curl -N http://localhost:8080/v1/chat/completions \
@@ -187,7 +191,7 @@ curl -N http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-> En mode `stream: true`, le serveur renvoie un flux SSE créé localement à partir de la réponse non‑stream de l’amont.
+> En mode `stream: true`, le serveur relaie le flux SSE de l’amont.
 
 ---
 
@@ -241,10 +245,9 @@ python evaluate_rag.py \
 
 ## 🗃️ Indexation & embeddings
 
-* Embeddings : `OrdalieTech/Solon-embeddings-large-0.1`
-* Splitter : `RecursiveCharacterTextSplitter(chunk_size=800, overlap=120)`
-* Persistant : `vectorstore.pkl`
-* **Patch tokenizer** : si le tokenizer n’a pas de `pad_token`, on utilise `eos` ou `sep` à défaut, sinon ajout `[PAD]` + `resize_token_embeddings` si possible.
+* Embeddings : `BAAI/bge-m3`
+* Splitter : `RecursiveCharacterTextSplitter(chunk_size=800, overlap=100)`
+* Persistant : `vectorstore_db/` (`index.faiss` + `chunks.pkl`)
 
 ---
 
@@ -252,26 +255,21 @@ python evaluate_rag.py \
 
 * **Stratégies** (`RAG_QUERY_STRATEGY`) :
 
-  * `vanilla` : pas de réécriture ni HyDE
+  * `simple` : pas de réécriture ni HyDE
   * `rewrite` : réécriture seule
   * `hyde` : HyDE seul
   * `rewrite+hyde` : réécriture puis HyDE (par défaut)
-* **Retrievers** :
-
-  * `MMR`: `k=8`, `fetch_k=24`, `lambda_mult=0.5`
-  * `similarity_score_threshold`: `score_threshold=0.25`, `k=12`
-* **Top‑K** : `RAG_TOP_K` (10 par défaut)
-* **Fenêtre d’historique** : `HISTORY_WINDOW` (6 par défaut)
+* **Top‑K** : `RAG_TOP_K` (8 par défaut)
+* **Fenêtre d’historique** : `RAG_HISTORY_WINDOW` (6 par défaut)
 
 ---
 
 ## 🧯 Dépannage
 
 * **401 Missing Authorization** : définissez `API_AUTH_TOKEN` côté serveur et envoyez l’en‑tête Bearer côté client.
-* **Vectorstore introuvable** : fournissez `wiki.txt` au premier lancement, ou placez un `vectorstore.pkl` existant.
+* **Vectorstore introuvable** : fournissez `wiki.txt` au premier lancement, ou placez un `vectorstore_db/` existant.
 * **Performances embeddings** : selon l’OS/CPU, préférez `faiss-gpu` si GPU dispo.
-* **Réponses « contexte insuffisant »** : augmentez `RAG_TOP_K`, améliorez `wiki.txt`, ou baissez `score_threshold`.
-* **Problèmes tokenizer** : le patch auto s’exécute, mais vous pouvez changer de modèle d’embeddings si nécessaire.
+* **Réponses « contexte insuffisant »** : augmentez `RAG_TOP_K`, améliorez `wiki.txt`, ou désactivez le reranking.
 
 ---
 
@@ -279,7 +277,7 @@ python evaluate_rag.py \
 
 * Nettoyez/structurez `wiki.txt` (titres, séparateurs) pour de meilleurs chunks
 * Ajustez `chunk_size`/`overlap` si vos documents sont hétérogènes
-* Re‑entraîner FAISS (reconstruire `vectorstore.pkl`) après de gros changements de corpus
+* Re‑entraîner FAISS (reconstruire `vectorstore_db/`) après de gros changements de corpus
 * Fixez `RAG_TOPIC_PREFIX` pour forcer un domaine (ex. « Kubernetes », « DSFR », etc.)
 
 ---
@@ -313,6 +311,6 @@ python evaluate_rag.py \
 .
 ├── app.py
 ├── wiki.txt                # optionnel, pour construire FAISS au premier run
-├── vectorstore.pkl         # généré automatiquement si absent et wiki.txt présent
+├── vectorstore_db/         # généré automatiquement si absent et wiki.txt présent
 └── README.md
 ```
