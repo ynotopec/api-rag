@@ -100,6 +100,7 @@ RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 # System Resources
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 CACHE_MAX_SIZE = 1000
+PORT = int(os.getenv("PORT", "8080"))
 
 # ===============================
 # Global State
@@ -844,4 +845,4 @@ async def _stream_generator(messages, req, sources):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
