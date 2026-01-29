@@ -57,7 +57,7 @@ OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "changeme")
 OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 
-AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")
+AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "changeme")
 
 # Models
 UPSTREAM_MODEL_RAG = os.getenv("UPSTREAM_MODEL_RAG", "gpt-4o-mini")
