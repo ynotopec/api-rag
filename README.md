@@ -166,6 +166,23 @@ export API_AUTH_TOKEN="my-inbound-token"
 uvicorn app:app --host 0.0.0.0 --port 8080
 ```
 
+### Lancer via `run.sh` (avec `.env`)
+
+Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`).
+
+```bash
+# Exemple minimal .env
+OPENAI_API_BASE="https://api.openai.com/v1"
+OPENAI_API_KEY="sk-..."
+API_AUTH_TOKEN="my-inbound-token"
+```
+
+Puis démarrez avec :
+
+```bash
+./run.sh 0.0.0.0 8080
+```
+
 ---
 
 ## 🧪 Appels API (exemples)
