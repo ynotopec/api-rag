@@ -6,9 +6,11 @@ import hashlib
 import asyncio
 import pickle
 import logging
+import mailbox
+import email
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator, Set
+from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator, Set, Iterable
 
 import numpy as np
 import httpx
@@ -66,6 +68,11 @@ MODEL_RAG_NAME = os.getenv("MODEL_RAG", "ai-rag")
 VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore_db")
 WIKI_PATH = os.getenv("WIKI_TXT", "wiki.txt")
 RAG_FORCE_REBUILD = os.getenv("RAG_FORCE_REBUILD", "false").lower() in {"1", "true", "yes"}
+INGESTION_SOURCES = os.getenv("INGESTION_SOURCES", "text")
+INGESTION_TEXT_PATHS = os.getenv("INGESTION_TEXT_PATHS", "").strip()
+THUNDERBIRD_PROFILE_DIR = os.getenv("THUNDERBIRD_PROFILE_DIR", "").strip()
+THUNDERBIRD_MAX_MESSAGES = int(os.getenv("THUNDERBIRD_MAX_MESSAGES", "10000"))
+INGESTION_REFRESH_INTERVAL = int(os.getenv("INGESTION_REFRESH_INTERVAL", "0"))
 
 # RAG Params
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
@@ -104,6 +111,9 @@ _embeddings: Optional[HuggingFaceEmbeddings] = None
 _reranker: Optional[Any] = None
 _http_client: Optional[httpx.AsyncClient] = None
 _executor: Optional[ThreadPoolExecutor] = None
+_index_lock: Optional[asyncio.Lock] = None
+_refresh_task: Optional[asyncio.Task] = None
+_last_ingestion_mtime: Optional[float] = None
 
 # Simple in-memory LRU-like caches
 _embedding_cache: Dict[str, List[float]] = {}
@@ -116,10 +126,11 @@ _hyde_cache: Dict[str, str] = {}
 # ===============================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client, _executor
+    global _http_client, _executor, _index_lock, _refresh_task
     
     # 1. Thread Pool for CPU bound tasks
     _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    _index_lock = asyncio.Lock()
     
     # 2. HTTP Client for upstream LLM calls
     _http_client = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=20))
@@ -132,10 +143,19 @@ async def lifespan(app: FastAPI):
 
     # 4. Load/Build Index
     await asyncio.get_event_loop().run_in_executor(_executor, _ensure_vectorstore)
+
+    if INGESTION_REFRESH_INTERVAL > 0:
+        _refresh_task = asyncio.create_task(_refresh_index_loop())
     
     logger.info("System Ready.")
     yield
     
+    if _refresh_task:
+        _refresh_task.cancel()
+        try:
+            await _refresh_task
+        except asyncio.CancelledError:
+            pass
     if _http_client:
         await _http_client.aclose()
     if _executor:
@@ -187,7 +207,7 @@ def _get_reranker():
 
 
 def _ensure_vectorstore():
-    global _vector, _bm25_retriever, _all_docs
+    global _vector, _bm25_retriever, _all_docs, _last_ingestion_mtime
     
     index_path = os.path.join(VECTORSTORE_DIR, "index.faiss")
     chunks_path = os.path.join(VECTORSTORE_DIR, "chunks.pkl")
@@ -195,13 +215,16 @@ def _ensure_vectorstore():
     rebuild = RAG_FORCE_REBUILD
     if not os.path.exists(index_path) or not os.path.exists(chunks_path):
         rebuild = True
-    elif os.path.exists(WIKI_PATH):
-        if os.path.getmtime(WIKI_PATH) > os.path.getmtime(VECTORSTORE_DIR):
-            logger.info("Wiki file updated, rebuilding index...")
+    else:
+        ingestion_mtime = _get_ingestion_latest_mtime()
+        _last_ingestion_mtime = ingestion_mtime
+        if ingestion_mtime and ingestion_mtime > os.path.getmtime(VECTORSTORE_DIR):
+            logger.info("Ingestion sources updated, rebuilding index...")
             rebuild = True
 
     if rebuild:
         _build_index()
+        _last_ingestion_mtime = _get_ingestion_latest_mtime()
     else:
         logger.info("Loading existing vector store...")
         try:
@@ -218,22 +241,18 @@ def _ensure_vectorstore():
 
 
 def _build_index():
-    global _vector, _bm25_retriever, _all_docs
-    logger.info(f"Building index from {WIKI_PATH}...")
-    
-    if not os.path.exists(WIKI_PATH):
-        # Create dummy index if file missing
-        logger.warning("Wiki file not found. Creating empty index.")
+    global _vector, _bm25_retriever, _all_docs, _last_ingestion_mtime
+    docs = _collect_ingestion_documents()
+    if not docs:
+        logger.warning("No ingestion documents found. Creating empty index.")
         docs = [Document(page_content="Welcome to the RAG system.", metadata={"source": "system"})]
     else:
-        loader = TextLoader(WIKI_PATH, encoding="utf-8")
-        raw_docs = loader.load()
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE, 
+            chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
-        docs = splitter.split_documents(raw_docs)
+        docs = splitter.split_documents(docs)
 
     embeddings = _get_embeddings()
     _vector = FAISS.from_documents(docs, embeddings)
@@ -246,6 +265,165 @@ def _build_index():
     if ENABLE_HYBRID_SEARCH:
         _bm25_retriever = BM25Retriever.from_documents(docs)
         _bm25_retriever.k = BM25_K
+    _last_ingestion_mtime = _get_ingestion_latest_mtime()
+
+
+async def _refresh_index_loop():
+    global _last_ingestion_mtime
+    while True:
+        await asyncio.sleep(INGESTION_REFRESH_INTERVAL)
+        ingestion_mtime = _get_ingestion_latest_mtime()
+        if not ingestion_mtime:
+            continue
+        if _last_ingestion_mtime and ingestion_mtime <= _last_ingestion_mtime:
+            continue
+        if not _index_lock:
+            continue
+        async with _index_lock:
+            logger.info("Detected new ingestion data. Rebuilding index...")
+            await asyncio.get_event_loop().run_in_executor(_executor, _build_index)
+            _last_ingestion_mtime = ingestion_mtime
+
+
+def _iter_text_paths(paths: Iterable[str]) -> List[str]:
+    collected = []
+    for raw_path in paths:
+        path = raw_path.strip()
+        if not path:
+            continue
+        if os.path.isdir(path):
+            for root, _, files in os.walk(path):
+                for filename in files:
+                    if filename.lower().endswith(".txt"):
+                        collected.append(os.path.join(root, filename))
+        elif os.path.isfile(path):
+            collected.append(path)
+        else:
+            logger.warning(f"Text ingestion path not found: {path}")
+    return collected
+
+
+def _load_text_documents() -> List[Document]:
+    if INGESTION_TEXT_PATHS:
+        raw_paths = [p for p in INGESTION_TEXT_PATHS.split(",") if p.strip()]
+    else:
+        raw_paths = [WIKI_PATH]
+    text_paths = _iter_text_paths(raw_paths)
+    docs: List[Document] = []
+    for path in text_paths:
+        loader = TextLoader(path, encoding="utf-8")
+        docs.extend(loader.load())
+    return docs
+
+
+def _is_thunderbird_mbox(filename: str) -> bool:
+    lower = filename.lower()
+    if lower.endswith(".msf"):
+        return False
+    if lower.endswith(".mbox"):
+        return True
+    return "." not in filename
+
+
+def _extract_email_body(message: email.message.Message) -> str:
+    if message.is_multipart():
+        for part in message.walk():
+            content_type = part.get_content_type()
+            disposition = part.get_content_disposition()
+            if content_type == "text/plain" and disposition != "attachment":
+                payload = part.get_payload(decode=True)
+                charset = part.get_content_charset() or "utf-8"
+                if payload is None:
+                    return ""
+                return payload.decode(charset, errors="replace")
+        return ""
+    payload = message.get_payload(decode=True)
+    if payload is None:
+        return ""
+    charset = message.get_content_charset() or "utf-8"
+    return payload.decode(charset, errors="replace")
+
+
+def _load_thunderbird_documents() -> List[Document]:
+    profile_dir = THUNDERBIRD_PROFILE_DIR
+    if not profile_dir:
+        logger.info("THUNDERBIRD_PROFILE_DIR not set; skipping Thunderbird ingestion.")
+        return []
+    if not os.path.isdir(profile_dir):
+        logger.warning(f"Thunderbird profile directory not found: {profile_dir}")
+        return []
+    docs: List[Document] = []
+    count = 0
+    for root, _, files in os.walk(profile_dir):
+        for filename in files:
+            if not _is_thunderbird_mbox(filename):
+                continue
+            mbox_path = os.path.join(root, filename)
+            try:
+                mbox = mailbox.mbox(mbox_path)
+            except Exception as exc:
+                logger.warning(f"Failed to open mbox {mbox_path}: {exc}")
+                continue
+            for message in mbox:
+                if THUNDERBIRD_MAX_MESSAGES and count >= THUNDERBIRD_MAX_MESSAGES:
+                    return docs
+                if not isinstance(message, email.message.Message):
+                    continue
+                subject = message.get("subject", "")
+                sender = message.get("from", "")
+                date = message.get("date", "")
+                body = _extract_email_body(message)
+                content = "\n".join(
+                    [
+                        f"Subject: {subject}",
+                        f"From: {sender}",
+                        f"Date: {date}",
+                        "",
+                        body.strip(),
+                    ]
+                ).strip()
+                if not content:
+                    continue
+                relative_path = os.path.relpath(mbox_path, profile_dir)
+                metadata = {
+                    "source": f"thunderbird:{relative_path}",
+                    "message_id": message.get("message-id", ""),
+                }
+                docs.append(Document(page_content=content, metadata=metadata))
+                count += 1
+    return docs
+
+
+def _collect_ingestion_documents() -> List[Document]:
+    sources = {s.strip().lower() for s in INGESTION_SOURCES.split(",") if s.strip()}
+    logger.info(f"Ingestion sources enabled: {', '.join(sorted(sources)) or 'none'}")
+    docs: List[Document] = []
+    if "text" in sources:
+        docs.extend(_load_text_documents())
+    if "thunderbird" in sources:
+        docs.extend(_load_thunderbird_documents())
+    return docs
+
+
+def _get_ingestion_latest_mtime() -> Optional[float]:
+    mtimes: List[float] = []
+    if "text" in {s.strip().lower() for s in INGESTION_SOURCES.split(",") if s.strip()}:
+        if INGESTION_TEXT_PATHS:
+            text_paths = _iter_text_paths(INGESTION_TEXT_PATHS.split(","))
+        else:
+            text_paths = _iter_text_paths([WIKI_PATH])
+        for path in text_paths:
+            try:
+                mtimes.append(os.path.getmtime(path))
+            except OSError:
+                continue
+    if "thunderbird" in {s.strip().lower() for s in INGESTION_SOURCES.split(",") if s.strip()}:
+        if THUNDERBIRD_PROFILE_DIR and os.path.isdir(THUNDERBIRD_PROFILE_DIR):
+            try:
+                mtimes.append(os.path.getmtime(THUNDERBIRD_PROFILE_DIR))
+            except OSError:
+                pass
+    return max(mtimes) if mtimes else None
 
 
 # ===============================
