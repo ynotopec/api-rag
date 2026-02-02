@@ -67,7 +67,7 @@ MODEL_RAG_NAME = os.getenv("MODEL_RAG", "ai-rag")
 # Vector Store
 VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore_db")
 WIKI_PATH = os.getenv("WIKI_TXT", "wiki.txt")
-RAG_FORCE_REBUILD = os.getenv("RAG_FORCE_REBUILD", "false").lower() in {"1", "true", "yes"}
+RAG_FORCE_REBUILD = os.getenv("RAG_FORCE_REBUILD", "true").lower() in {"1", "true", "yes"}
 INGESTION_SOURCES = os.getenv("INGESTION_SOURCES", "text")
 INGESTION_TEXT_PATHS = os.getenv("INGESTION_TEXT_PATHS", "").strip()
 THUNDERBIRD_PROFILE_DIR = os.getenv("THUNDERBIRD_PROFILE_DIR", "").strip()
