@@ -670,6 +670,34 @@ async def _extract_corrections_with_llm(message: str) -> List[str]:
     cleaned = response.strip()
     if not cleaned or cleaned.upper() == "NULL":
         return []
+    if cleaned.lstrip().startswith(("{", "[")):
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(payload, dict):
+            for key in ("text", "correction"):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    normalized = _normalize_correction(value)
+                    return [normalized] if normalized else []
+            corrections = payload.get("corrections")
+            if isinstance(corrections, list):
+                normalized = [
+                    _normalize_correction(item)
+                    for item in corrections
+                    if isinstance(item, str) and _normalize_correction(item)
+                ]
+                return normalized
+            return []
+        if isinstance(payload, list):
+            normalized = [
+                _normalize_correction(item)
+                for item in payload
+                if isinstance(item, str) and _normalize_correction(item)
+            ]
+            return normalized
+        return []
     return [_normalize_correction(cleaned)]
 
 async def _call_upstream_llm(
