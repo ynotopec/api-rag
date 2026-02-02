@@ -83,7 +83,7 @@ HISTORY_WINDOW = int(os.getenv("RAG_HISTORY_WINDOW", "6"))
 # Optimization Flags
 ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
 ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
-ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "false").lower() == "true" # Disabled by default for speed
+ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "true").lower() == "true"
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
 
 # Chunking
