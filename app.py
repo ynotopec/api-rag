@@ -85,6 +85,7 @@ ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "tru
 ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
 ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "false").lower() == "true" # Disabled by default for speed
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
+ENABLE_AUTO_CORRECTIONS = os.getenv("ENABLE_AUTO_CORRECTIONS", "false").lower() == "true"
 
 # Chunking
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
@@ -128,6 +129,14 @@ _embedding_cache: Dict[str, List[float]] = {}
 _query_rewrite_cache: Dict[str, str] = {}
 _hyde_cache: Dict[str, str] = {}
 _correction_prefixes = ("correction:", "rectification:", "mise à jour:", "mise a jour:", "update:")
+_correction_auto_triggers = (
+    "correction",
+    "rectification",
+    "mise à jour",
+    "mise a jour",
+    "update",
+    "voici la correction",
+)
 
 
 # ===============================
@@ -529,6 +538,10 @@ def _extract_corrections(messages: List[ChatMessage]) -> List[str]:
                 break
     return corrections
 
+def _should_auto_extract_corrections(message: str) -> bool:
+    lowered = message.lower()
+    return any(trigger in lowered for trigger in _correction_auto_triggers)
+
 def _format_corrections(corrections: List[str]) -> str:
     if not corrections:
         return ""
@@ -651,6 +664,32 @@ async def _apply_corrections_overlay(
         max_tokens=1000
     )
     return revised.strip() or answer
+
+async def _extract_corrections_with_llm(message: str) -> List[str]:
+    system = (
+        "You extract user corrections from a message. "
+        "Return ONLY a JSON array of correction strings. "
+        "If there is no correction, return []."
+    )
+    prompt = (
+        "Message:\n"
+        f"{message}\n\n"
+        "JSON:"
+    )
+    response = await _call_upstream_llm(
+        [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        model=UPSTREAM_MODEL_REWRITE,
+        max_tokens=300
+    )
+    if not response:
+        return []
+    try:
+        data = json.loads(response.strip())
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [_normalize_correction(item) for item in data if isinstance(item, str) and item.strip()]
 
 async def _call_upstream_llm(
     messages: List[Dict[str, str]], 
@@ -934,6 +973,10 @@ async def chat_endpoint(
     # 1. Retrieve Context
     convo_id = _get_conversation_id(req.messages, conversation_id)
     corrections = _extract_corrections(req.messages)
+    if not corrections and ENABLE_AUTO_CORRECTIONS:
+        last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
+        if last_user and _should_auto_extract_corrections(last_user.content):
+            corrections = await _extract_corrections_with_llm(last_user.content)
     await _persist_corrections(convo_id, corrections)
     rag_start = time.time()
     rag_result = await _retrieve_pipeline(req.messages)
@@ -948,7 +991,17 @@ async def chat_endpoint(
         # Fallback to pure chat
         final_messages = [{"role": m.role, "content": m.content} for m in req.messages]
         if not rag_result["skip"]:
-             final_messages.insert(0, {"role": "system", "content": "Knowledge base check returned no results. Answer based on general knowledge."})
+             final_messages.insert(
+                 0,
+                 {
+                     "role": "system",
+                     "content": (
+                         "Knowledge base check returned no results. "
+                         "Ask the user for missing details or corrections, and explain that "
+                         "their response can be stored to improve future answers."
+                     )
+                 }
+             )
     else:
         # Inject Context
         sys_prompt = (
