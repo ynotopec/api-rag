@@ -101,6 +101,10 @@ RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 CACHE_MAX_SIZE = 1000
 PORT = int(os.getenv("PORT", "8080"))
+CORRECTIONS_VECTORSTORE_DIR = os.getenv("CORRECTIONS_VECTORSTORE_DIR", "corrections_db")
+CORRECTIONS_TOP_K = int(os.getenv("CORRECTIONS_TOP_K", "4"))
+CORRECTIONS_JSON_PATH = os.getenv("CORRECTIONS_JSON_PATH", "corrections_db/corrections.jsonl")
+CORRECTIONS_FORCE_REBUILD = os.getenv("CORRECTIONS_FORCE_REBUILD", "false").lower() in {"1", "true", "yes"}
 
 # ===============================
 # Global State
@@ -115,11 +119,15 @@ _executor: Optional[ThreadPoolExecutor] = None
 _index_lock: Optional[asyncio.Lock] = None
 _refresh_task: Optional[asyncio.Task] = None
 _last_ingestion_mtime: Optional[float] = None
+_correction_vector: Optional[FAISS] = None
+_correction_docs: List[Document] = []
+_correction_lock: Optional[asyncio.Lock] = None
 
 # Simple in-memory LRU-like caches
 _embedding_cache: Dict[str, List[float]] = {}
 _query_rewrite_cache: Dict[str, str] = {}
 _hyde_cache: Dict[str, str] = {}
+_correction_prefixes = ("correction:", "rectification:", "mise à jour:", "mise a jour:", "update:")
 
 
 # ===============================
@@ -127,11 +135,12 @@ _hyde_cache: Dict[str, str] = {}
 # ===============================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client, _executor, _index_lock, _refresh_task
+    global _http_client, _executor, _index_lock, _refresh_task, _correction_lock
     
     # 1. Thread Pool for CPU bound tasks
     _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     _index_lock = asyncio.Lock()
+    _correction_lock = asyncio.Lock()
     
     # 2. HTTP Client for upstream LLM calls
     _http_client = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=20))
@@ -144,6 +153,7 @@ async def lifespan(app: FastAPI):
 
     # 4. Load/Build Index
     await asyncio.get_event_loop().run_in_executor(_executor, _ensure_vectorstore)
+    await asyncio.get_event_loop().run_in_executor(_executor, _ensure_correction_store)
 
     if INGESTION_REFRESH_INTERVAL > 0:
         _refresh_task = asyncio.create_task(_refresh_index_loop())
@@ -267,6 +277,37 @@ def _build_index():
         _bm25_retriever = BM25Retriever.from_documents(docs)
         _bm25_retriever.k = BM25_K
     _last_ingestion_mtime = _get_ingestion_latest_mtime()
+
+def _ensure_correction_store():
+    global _correction_vector, _correction_docs
+    index_path = os.path.join(CORRECTIONS_VECTORSTORE_DIR, "index.faiss")
+    docs_path = os.path.join(CORRECTIONS_VECTORSTORE_DIR, "corrections.pkl")
+
+    if not CORRECTIONS_FORCE_REBUILD and os.path.exists(index_path) and os.path.exists(docs_path):
+        try:
+            _correction_vector = FAISS.load_local(
+                CORRECTIONS_VECTORSTORE_DIR,
+                _get_embeddings(),
+                allow_dangerous_deserialization=True
+            )
+            with open(docs_path, "rb") as f:
+                _correction_docs = pickle.load(f)
+            return
+        except Exception as e:
+            logger.error(f"Error loading correction index: {e}. Rebuilding...")
+
+    os.makedirs(CORRECTIONS_VECTORSTORE_DIR, exist_ok=True)
+    documents = _load_corrections_from_json()
+    if not documents:
+        documents = [Document(
+            page_content="correction seed",
+            metadata={"source": "system", "type": "seed"}
+        )]
+    _correction_vector = FAISS.from_documents(documents, _get_embeddings())
+    _correction_vector.save_local(CORRECTIONS_VECTORSTORE_DIR)
+    _correction_docs = documents
+    with open(docs_path, "wb") as f:
+        pickle.dump(_correction_docs, f)
 
 
 async def _refresh_index_loop():
@@ -461,6 +502,155 @@ def check_auth(authorization: str = Header(None)):
 # ===============================
 def _get_cache_key(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
+
+def _normalize_correction(text: str) -> str:
+    return " ".join(text.split())
+
+def _get_conversation_id(
+    messages: List[ChatMessage],
+    header_conversation_id: Optional[str]
+) -> str:
+    if header_conversation_id:
+        return header_conversation_id.strip()
+    seed = "|".join([f"{m.role}:{m.content}" for m in messages[:3]])
+    return _get_cache_key(seed or str(uuid.uuid4()))
+
+def _extract_corrections(messages: List[ChatMessage]) -> List[str]:
+    corrections = []
+    for message in messages:
+        if message.role != "user":
+            continue
+        content = message.content.strip()
+        lowered = content.lower()
+        for prefix in _correction_prefixes:
+            if lowered.startswith(prefix):
+                correction = content[len(prefix):].strip() or content
+                corrections.append(_normalize_correction(correction))
+                break
+    return corrections
+
+def _format_corrections(corrections: List[str]) -> str:
+    if not corrections:
+        return ""
+    ordered = list(reversed(corrections))
+    return "\n".join(f"- {item}" for item in ordered)
+
+def _add_corrections_to_store(conversation_id: str, corrections: List[str]) -> None:
+    global _correction_vector, _correction_docs
+    if not corrections or not _correction_vector:
+        return
+    new_docs = []
+    for correction in corrections:
+        normalized = _normalize_correction(correction)
+        if not normalized:
+            continue
+        new_docs.append(Document(
+            page_content=normalized,
+            metadata={
+                "source": "user_correction",
+                "conversation_id": conversation_id,
+                "created_at": time.time()
+            }
+        ))
+        _append_correction_to_json(conversation_id, normalized)
+    if not new_docs:
+        return
+    _correction_vector.add_documents(new_docs)
+    _correction_docs.extend(new_docs)
+    _correction_vector.save_local(CORRECTIONS_VECTORSTORE_DIR)
+    with open(os.path.join(CORRECTIONS_VECTORSTORE_DIR, "corrections.pkl"), "wb") as f:
+        pickle.dump(_correction_docs, f)
+
+async def _persist_corrections(conversation_id: str, corrections: List[str]) -> None:
+    if not corrections or not conversation_id:
+        return
+    if not _correction_lock:
+        return
+    async with _correction_lock:
+        await asyncio.get_event_loop().run_in_executor(
+            _executor,
+            _add_corrections_to_store,
+            conversation_id,
+            corrections
+        )
+
+def _filter_correction_docs(docs: List[Document]) -> List[Document]:
+    return [
+        doc for doc in docs
+        if doc.metadata.get("type") != "seed"
+    ]
+
+def _append_correction_to_json(conversation_id: str, correction: str) -> None:
+    os.makedirs(os.path.dirname(CORRECTIONS_JSON_PATH) or ".", exist_ok=True)
+    entry = {
+        "conversation_id": conversation_id,
+        "correction": correction,
+        "created_at": time.time()
+    }
+    with open(CORRECTIONS_JSON_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def _load_corrections_from_json() -> List[Document]:
+    if not os.path.exists(CORRECTIONS_JSON_PATH):
+        return []
+    documents = []
+    try:
+        with open(CORRECTIONS_JSON_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                correction = _normalize_correction(entry.get("correction", ""))
+                if not correction:
+                    continue
+                documents.append(Document(
+                    page_content=correction,
+                    metadata={
+                        "source": "user_correction",
+                        "conversation_id": entry.get("conversation_id", ""),
+                        "created_at": entry.get("created_at", time.time())
+                    }
+                ))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error(f"Failed to load corrections json: {exc}")
+        return []
+    return documents
+
+async def _retrieve_relevant_corrections(query: str) -> List[str]:
+    if not _correction_vector:
+        return []
+    def search():
+        return _correction_vector.similarity_search(query, k=CORRECTIONS_TOP_K)
+    docs = await asyncio.get_event_loop().run_in_executor(_executor, search)
+    docs = _filter_correction_docs(docs)
+    return [doc.page_content for doc in docs]
+
+async def _apply_corrections_overlay(
+    answer: str,
+    user_query: str
+) -> str:
+    if not answer.strip():
+        return answer
+    corrections = await _retrieve_relevant_corrections(f"{user_query}\n{answer}")
+    if not corrections:
+        return answer
+    system = (
+        "You are an assistant that checks whether the answer conflicts with or omits "
+        "user-provided corrections. If changes are needed, revise the answer to align "
+        "with the corrections. If no changes are needed, return the original answer unchanged."
+    )
+    prompt = (
+        f"Original answer:\n{answer}\n\n"
+        f"Corrections:\n{_format_corrections(corrections)}\n\n"
+        "Return the final answer:"
+    )
+    revised = await _call_upstream_llm(
+        [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        model=UPSTREAM_MODEL_RAG,
+        max_tokens=1000
+    )
+    return revised.strip() or answer
 
 async def _call_upstream_llm(
     messages: List[Dict[str, str]], 
@@ -734,11 +924,17 @@ def list_models():
     return {"data": [{"id": MODEL_RAG_NAME, "object": "model"}]}
 
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
-async def chat_endpoint(req: ChatReq):
+async def chat_endpoint(
+    req: ChatReq,
+    conversation_id: Optional[str] = Header(None, alias="X-Conversation-Id")
+):
     if req.model != MODEL_RAG_NAME:
         raise HTTPException(400, f"Unknown model. Use {MODEL_RAG_NAME}")
 
     # 1. Retrieve Context
+    convo_id = _get_conversation_id(req.messages, conversation_id)
+    corrections = _extract_corrections(req.messages)
+    await _persist_corrections(convo_id, corrections)
     rag_start = time.time()
     rag_result = await _retrieve_pipeline(req.messages)
     rag_time = time.time() - rag_start
@@ -775,7 +971,7 @@ async def chat_endpoint(req: ChatReq):
     # 3. Stream or Return
     if req.stream:
         return StreamingResponse(
-            _stream_generator(final_messages, req, rag_result["sources"]),
+            _stream_generator(final_messages, req, rag_result["sources"], req.messages[-1].content),
             media_type="text/event-stream"
         )
     else:
@@ -795,6 +991,7 @@ async def chat_endpoint(req: ChatReq):
             data = resp.json()
             
         content = data["choices"][0]["message"]["content"]
+        content = await _apply_corrections_overlay(content, req.messages[-1].content)
         if rag_result["sources"]:
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
             
@@ -806,7 +1003,7 @@ async def chat_endpoint(req: ChatReq):
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
         }
 
-async def _stream_generator(messages, req, sources):
+async def _stream_generator(messages, req, sources, user_query):
     """Yields SSE events."""
     payload = {
         "model": UPSTREAM_MODEL_RAG,
@@ -814,20 +1011,23 @@ async def _stream_generator(messages, req, sources):
         "temperature": req.temperature,
         "presence_penalty": 0.0,   # Nouveau
         "frequency_penalty": 0.3,  # <--- AJOUTER CECI
-        "stream": True
+        "stream": False
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     
     async with httpx.AsyncClient() as client:
-        async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers) as resp:
-            async for line in resp.aiter_lines():
-                if line.startswith("data: ") and line != "data: [DONE]":
-                    try:
-                        data = json.loads(line[6:])
-                        # Clean up model name in response
-                        data["model"] = MODEL_RAG_NAME
-                        yield f"data: {json.dumps(data)}\n\n"
-                    except: pass
+        resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        content = await _apply_corrections_overlay(content, user_query)
+        chunk = {
+            "id": data.get("id", f"chatcmpl-{uuid.uuid4()}"),
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": MODEL_RAG_NAME,
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
     
     # Append sources at the end
     if sources:
