@@ -46,26 +46,34 @@ flowchart LR
 
     subgraph rag[Pipeline RAG]
         direction TB
-        ensure["Chargement FAISS<br/>(_ensure_vectorstore)"]
-        rewrite["Réécriture FR<br/>UPSTREAM_MODEL_REWRITE"]
-        hyde["HyDE<br/>pseudo-réponse"]
-        retriever_mmr["Retrieval similarity_search<br/>(q / q' / h)"]
-        retriever_thresh["Fusion RRF<br/>+ dédup + reranking"]
-        dedup["Sélection top‑K"]
+        ensure["Chargement/MAJ index<br/>FAISS + BM25"]
+        classify["Classification rapide<br/>RAG vs CHAT"]
+        original["Recherche immédiate<br/>similarity_search(q)<br/>+ BM25 (optionnel)"]
+        rewrite["Réécriture requête (q')<br/>UPSTREAM_MODEL_REWRITE"]
+        hyde["HyDE (h)<br/>pseudo-document"]
+        search_rewrite["Recherche q'"]
+        search_hyde["Recherche h"]
+        fusion["Fusion RRF"]
+        dedup["Déduplication rapide"]
+        rerank["Reranking CrossEncoder<br/>(optionnel)"]
+        topk["Sélection top‑K + formatage"]
         prompt["Contexte + historique<br/>→ prompt final"]
         rag_call["Appel UPSTREAM_MODEL_RAG"]
-        ensure --> rewrite
-        rewrite --> retriever_mmr
-        rewrite --> hyde
-        hyde --> retriever_thresh
-        retriever_mmr --> dedup
-        retriever_thresh --> dedup
-        dedup --> prompt
-        prompt --> rag_call
+        fallback["Fallback chat (sans contexte)"]
+        ensure --> classify
+        classify -->|CHAT| fallback
+        classify -->|RAG| original
+        original --> fusion
+        rewrite --> search_rewrite
+        hyde --> search_hyde
+        search_rewrite --> fusion
+        search_hyde --> fusion
+        fusion --> dedup --> rerank --> topk --> prompt --> rag_call
     end
 
     dispatch -->|ai-rag| ensure
     rag_call --> format
+    fallback --> format
     format --> stream["Streaming SSE relayé<br/>ou JSON"]
     stream --> client
 ```
