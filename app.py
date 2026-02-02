@@ -129,6 +129,7 @@ _embedding_cache: Dict[str, List[float]] = {}
 _query_rewrite_cache: Dict[str, str] = {}
 _hyde_cache: Dict[str, str] = {}
 _correction_prefixes = ("correction:", "rectification:", "mise à jour:", "mise a jour:", "update:")
+_memorize_prefixes = ("mémoriser", "memoriser", "mémorise", "memorise")
 
 
 # ===============================
@@ -507,6 +508,21 @@ def _get_cache_key(text: str) -> str:
 def _normalize_correction(text: str) -> str:
     return " ".join(text.split())
 
+def _strip_memorize_prefix(content: str) -> Optional[str]:
+    lowered = content.lower().lstrip()
+    if not lowered.startswith(_memorize_prefixes):
+        return None
+    if ":" in content:
+        remainder = content.split(":", 1)[1].strip()
+        if remainder:
+            return remainder
+    lines = content.splitlines()
+    if len(lines) > 1:
+        remainder = "\n".join(lines[1:]).strip()
+        if remainder:
+            return remainder
+    return content.strip() or None
+
 def _get_conversation_id(
     messages: List[ChatMessage],
     header_conversation_id: Optional[str]
@@ -528,6 +544,10 @@ def _extract_corrections(messages: List[ChatMessage]) -> List[str]:
                 correction = content[len(prefix):].strip() or content
                 corrections.append(_normalize_correction(correction))
                 break
+        else:
+            memo = _strip_memorize_prefix(content)
+            if memo:
+                corrections.append(_normalize_correction(memo))
     return corrections
 
 def _format_corrections(corrections: List[str]) -> str:
