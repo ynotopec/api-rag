@@ -13,6 +13,7 @@ Un serveur **FastAPI** exposant une API **compatible OpenAI** (`/v1/chat/complet
 * **RAG conversationnel** avec stratégie **rewrite + HyDE** (configurable)
 * **FAISS** persistant via `vectorstore_db/` (auto‑construction si `wiki.txt` est présent)
 * **Réécriture de requête** et **HyDE** (configurables) pour améliorer le rappel documentaire
+* **Recherche hybride FAISS + BM25** (activée par défaut, configurable)
 * **Fusion RRF + déduplication + reranking** des chunks (optionnels)
 * **Sources** renvoyées dans la réponse (suffixe « Sources: … »)
 * **Streaming SSE** relayé depuis l’amont (chunks OpenAI)
@@ -47,7 +48,7 @@ flowchart LR
     subgraph rag[Pipeline RAG]
         direction TB
         ensure["Chargement/MAJ index<br/>FAISS + BM25"]
-        classify["Classification rapide<br/>RAG vs CHAT"]
+        classify["Classification rapide<br/>RAG vs CHAT (optionnelle)"]
         original["Recherche immédiate<br/>similarity_search(q)<br/>+ BM25 (optionnel)"]
         rewrite["Réécriture requête (q')<br/>UPSTREAM_MODEL_REWRITE"]
         hyde["HyDE (h)<br/>pseudo-document"]
@@ -80,20 +81,21 @@ flowchart LR
 
 ### Détails étape par étape
 
-0. **Vectorstore** (`_ensure_vectorstore`) : charge `vectorstore_db/` (index FAISS + `chunks.pkl`), le reconstruit si absent, si `RAG_FORCE_REBUILD=on`, ou si `wiki.txt` est plus récent.
+0. **Vectorstore** (`_ensure_vectorstore`) : charge `vectorstore_db/` (index FAISS + `chunks.pkl`), le reconstruit si absent, si `RAG_FORCE_REBUILD=on`, ou si les sources d’ingestion sont plus récentes.
 1. **Historique court** : un extrait des 3 derniers messages précédents est construit pour la réécriture.
 2. **Réécriture** (`_rewrite_query`) : le serveur appelle le LLM amont (param `UPSTREAM_MODEL_REWRITE`) pour produire une requête optimisée.
 3. **HyDE** (`_hyde_expand`) : on génère un pseudo‑document court à partir de la requête utilisateur.
-4. **Retrieval** (`_retrieve_pipeline`) :
+4. **Classification (optionnelle)** : un filtre rapide **RAG vs CHAT** peut forcer un fallback sans contexte si activé (`ENABLE_QUERY_CLASSIFICATION=true`).
+5. **Retrieval** (`_retrieve_pipeline`) :
 
    * **Recherche immédiate** sur la requête utilisateur.
    * **Recherche secondaire** sur la requête réécrite (si activée).
    * **Recherche HyDE** sur le pseudo‑document (si activée).
    * **Hybrid BM25** optionnel en complément.
-5. **Fusion & déduplication** : fusion RRF, déduplication (hash + fuzzy match), reranking optionnel.
-6. **Contexte** : concaténation des `RAG_TOP_K` premiers chunks.
-7. **Génération** : on envoie au modèle amont un prompt système + le **contexte** + l’historique récent.
-8. **Sources** : noms de fichiers (métadonnée `source`) déduits des chunks retenus.
+6. **Fusion & déduplication** : fusion RRF, déduplication (hash + fuzzy match), reranking optionnel.
+7. **Contexte** : concaténation des `RAG_TOP_K` premiers chunks.
+8. **Génération** : on envoie au modèle amont un prompt système + le **contexte** + l’historique récent.
+9. **Sources** : noms de fichiers (métadonnée `source`) déduits des chunks retenus.
 
 > ⚠️ Si aucun chunk pertinent : réponse courte indiquant l’insuffisance du contexte.
 
@@ -127,12 +129,13 @@ flowchart LR
 | `THUNDERBIRD_PROFILE_DIR` | *(vide)* | Chemin du profil Thunderbird local (Windows : `%APPDATA%\\Thunderbird\\Profiles\\<profil>`). |
 | `THUNDERBIRD_MAX_MESSAGES` | `10000` | Limite max de messages ingérés depuis Thunderbird. |
 | `INGESTION_REFRESH_INTERVAL` | `0` | Intervalle (secondes) pour rebalayer les sources et reconstruire l’index si besoin. |
-| `RAG_FORCE_REBUILD` | *(vide)* | Si `1/true/on` : force la reconstruction du FAISS au démarrage. |
+| `RAG_FORCE_REBUILD` | `true` | Si `1/true/on` : force la reconstruction du FAISS au démarrage. |
 | `RAG_TOP_K` | `8` | Nombre max de chunks concaténés dans le contexte. |
 | `RAG_QUERY_STRATEGY` | `rewrite+hyde` | `simple`, `rewrite`, `hyde` ou `rewrite+hyde`. |
 | `RAG_HISTORY_WINDOW` | `6` | Nb. de messages conservés pour le prompt final. |
 | `ENABLE_HYBRID_SEARCH` | `true` | Active la recherche BM25 hybride. |
 | `ENABLE_RERANKING` | `true` | Active le reranking CrossEncoder. |
+| `ENABLE_QUERY_CLASSIFICATION` | `true` | Active la classification rapide RAG vs CHAT. |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | Modèle d’embeddings utilisé. |
 | `BM25_K` | `4` | Nombre de résultats BM25 pris en compte. |
 | `PORT` | `8080` | Port HTTP local. |
