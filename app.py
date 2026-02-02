@@ -137,6 +137,14 @@ _correction_auto_triggers = (
     "update",
     "voici la correction",
 )
+_correction_response_markers = (
+    "voici la réponse que j'attendais",
+    "voici la reponse que j'attendais",
+    "voici la réponse que j’attendais",
+    "voici la reponse que j’attendais",
+    "voici la réponse attendue",
+    "voici la reponse attendue",
+)
 
 
 # ===============================
@@ -536,7 +544,22 @@ def _extract_corrections(messages: List[ChatMessage]) -> List[str]:
                 correction = content[len(prefix):].strip() or content
                 corrections.append(_normalize_correction(correction))
                 break
+        marker_correction = _extract_correction_from_marker(content, lowered)
+        if marker_correction:
+            corrections.append(marker_correction)
     return corrections
+
+def _extract_correction_from_marker(content: str, lowered: str) -> str:
+    for marker in _correction_response_markers:
+        index = lowered.find(marker)
+        if index == -1:
+            continue
+        remainder = content[index + len(marker):].lstrip()
+        if remainder.startswith(":"):
+            remainder = remainder[1:].lstrip()
+        if remainder:
+            return _normalize_correction(remainder)
+    return ""
 
 def _should_auto_extract_corrections(message: str) -> bool:
     lowered = message.lower()
