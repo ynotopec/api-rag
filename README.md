@@ -17,6 +17,7 @@ Un serveur **FastAPI** exposant une API **compatible OpenAI** (`/v1/chat/complet
 * **Sources** renvoyées dans la réponse (suffixe « Sources: … »)
 * **Streaming SSE** relayé depuis l’amont (chunks OpenAI)
 * **Auth Bearer** optionnelle côté entrée, **clé OpenAI** côté sortie
+* **Apprentissage par corrections utilisateur** persisté dans `corrections_db/` (auto-détection activable)
 
 ---
 
@@ -125,9 +126,23 @@ flowchart LR
 | `RAG_HISTORY_WINDOW` | `6` | Nb. de messages conservés pour le prompt final. |
 | `ENABLE_HYBRID_SEARCH` | `true` | Active la recherche BM25 hybride. |
 | `ENABLE_RERANKING` | `true` | Active le reranking CrossEncoder. |
+| `ENABLE_AUTO_CORRECTIONS` | `true` | Active l’auto-extraction des corrections utilisateur (fallback sur LLM amont). |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | Modèle d’embeddings utilisé. |
 | `BM25_K` | `4` | Nombre de résultats BM25 pris en compte. |
 | `PORT` | `8080` | Port HTTP local. |
+
+---
+
+## 📝 Apprentissage via corrections utilisateur
+
+Le serveur peut **mémoriser des corrections** faites par l’utilisateur et les **réappliquer** sur les réponses futures.
+
+Deux modes sont supportés :
+
+1. **Corrections explicites** : préfixez votre message par `correction:` ou `rectification:` (ex. `correction: le prix est 19€`).
+2. **Auto-extraction** (optionnelle, activée par `ENABLE_AUTO_CORRECTIONS=true`) : le serveur envoie le message au LLM amont avec la consigne : « Extraire les nouvelles informations pertinentes pour le futur et qui ne vont pas à l'encontre du bien commun. Sinon répondre NULL. ». Si le modèle répond `NULL`, aucune correction n’est mémorisée.
+
+Les corrections sont persistées dans `corrections_db/corrections.jsonl` et rechargées au démarrage.
 
 ---
 

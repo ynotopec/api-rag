@@ -10,7 +10,7 @@ import mailbox
 import email
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator, Set, Iterable
+from typing import List, Optional, Dict, Any, AsyncGenerator, Set, Iterable
 
 import numpy as np
 import httpx
@@ -85,7 +85,7 @@ ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "tru
 ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
 ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "false").lower() == "true" # Disabled by default for speed
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
-ENABLE_AUTO_CORRECTIONS = os.getenv("ENABLE_AUTO_CORRECTIONS", "false").lower() == "true"
+ENABLE_AUTO_CORRECTIONS = os.getenv("ENABLE_AUTO_CORRECTIONS", "true").lower() == "true"
 
 # Chunking
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
@@ -129,22 +129,6 @@ _embedding_cache: Dict[str, List[float]] = {}
 _query_rewrite_cache: Dict[str, str] = {}
 _hyde_cache: Dict[str, str] = {}
 _correction_prefixes = ("correction:", "rectification:", "mise à jour:", "mise a jour:", "update:")
-_correction_auto_triggers = (
-    "correction",
-    "rectification",
-    "mise à jour",
-    "mise a jour",
-    "update",
-    "voici la correction",
-)
-_correction_response_markers = (
-    "voici la réponse que j'attendais",
-    "voici la reponse que j'attendais",
-    "voici la réponse que j’attendais",
-    "voici la reponse que j’attendais",
-    "voici la réponse attendue",
-    "voici la reponse attendue",
-)
 
 
 # ===============================
@@ -544,26 +528,7 @@ def _extract_corrections(messages: List[ChatMessage]) -> List[str]:
                 correction = content[len(prefix):].strip() or content
                 corrections.append(_normalize_correction(correction))
                 break
-        marker_correction = _extract_correction_from_marker(content, lowered)
-        if marker_correction:
-            corrections.append(marker_correction)
     return corrections
-
-def _extract_correction_from_marker(content: str, lowered: str) -> str:
-    for marker in _correction_response_markers:
-        index = lowered.find(marker)
-        if index == -1:
-            continue
-        remainder = content[index + len(marker):].lstrip()
-        if remainder.startswith(":"):
-            remainder = remainder[1:].lstrip()
-        if remainder:
-            return _normalize_correction(remainder)
-    return ""
-
-def _should_auto_extract_corrections(message: str) -> bool:
-    lowered = message.lower()
-    return any(trigger in lowered for trigger in _correction_auto_triggers)
 
 def _format_corrections(corrections: List[str]) -> str:
     if not corrections:
@@ -690,15 +655,11 @@ async def _apply_corrections_overlay(
 
 async def _extract_corrections_with_llm(message: str) -> List[str]:
     system = (
-        "You extract user corrections from a message. "
-        "Return ONLY a JSON array of correction strings. "
-        "If there is no correction, return []."
+        "Extraire les nouvelles informations pertinentes pour le futur "
+        "et qui ne vont pas à l'encontre du bien commun. "
+        "Sinon répondre NULL."
     )
-    prompt = (
-        "Message:\n"
-        f"{message}\n\n"
-        "JSON:"
-    )
+    prompt = f"Message:\n{message}\n\nRéponse:"
     response = await _call_upstream_llm(
         [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         model=UPSTREAM_MODEL_REWRITE,
@@ -706,13 +667,10 @@ async def _extract_corrections_with_llm(message: str) -> List[str]:
     )
     if not response:
         return []
-    try:
-        data = json.loads(response.strip())
-    except json.JSONDecodeError:
+    cleaned = response.strip()
+    if not cleaned or cleaned.upper() == "NULL":
         return []
-    if not isinstance(data, list):
-        return []
-    return [_normalize_correction(item) for item in data if isinstance(item, str) and item.strip()]
+    return [_normalize_correction(cleaned)]
 
 async def _call_upstream_llm(
     messages: List[Dict[str, str]], 
@@ -998,7 +956,7 @@ async def chat_endpoint(
     corrections = _extract_corrections(req.messages)
     if not corrections and ENABLE_AUTO_CORRECTIONS:
         last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
-        if last_user and _should_auto_extract_corrections(last_user.content):
+        if last_user:
             corrections = await _extract_corrections_with_llm(last_user.content)
     await _persist_corrections(convo_id, corrections)
     rag_start = time.time()
