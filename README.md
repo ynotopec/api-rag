@@ -114,6 +114,11 @@ flowchart LR
 | `MODEL_RAG` | `ai-rag` | Nom logique exposé pour le pipeline RAG. |
 | `VECTORSTORE_DIR` | `vectorstore_db` | Dossier du FAISS sérialisé (persisté sur disque). |
 | `WIKI_TXT` | `wiki.txt` | Corpus brut utilisé pour construire le FAISS si absent. |
+| `INGESTION_SOURCES` | `text` | Sources d’ingestion activées (`text`, `thunderbird`, ou liste séparée par des virgules). |
+| `INGESTION_TEXT_PATHS` | *(vide)* | Liste de fichiers ou dossiers `.txt` (séparés par virgule). Si vide, utilise `WIKI_TXT`. |
+| `THUNDERBIRD_PROFILE_DIR` | *(vide)* | Chemin du profil Thunderbird local (Windows : `%APPDATA%\\Thunderbird\\Profiles\\<profil>`). |
+| `THUNDERBIRD_MAX_MESSAGES` | `10000` | Limite max de messages ingérés depuis Thunderbird. |
+| `INGESTION_REFRESH_INTERVAL` | `0` | Intervalle (secondes) pour rebalayer les sources et reconstruire l’index si besoin. |
 | `RAG_FORCE_REBUILD` | *(vide)* | Si `1/true/on` : force la reconstruction du FAISS au démarrage. |
 | `RAG_TOP_K` | `8` | Nombre max de chunks concaténés dans le contexte. |
 | `RAG_QUERY_STRATEGY` | `rewrite+hyde` | `simple`, `rewrite`, `hyde` ou `rewrite+hyde`. |
@@ -147,7 +152,10 @@ pip install -r requirements.txt
 
 ### Données
 
-* Placez vos contenus dans `wiki.txt` (texte brut). Au premier démarrage sans `vectorstore_db/`, l’index sera construit et persisté.
+* Par défaut, placez vos contenus dans `wiki.txt` (texte brut). Au premier démarrage sans `vectorstore_db/`, l’index sera construit et persisté.
+* Pour plusieurs fichiers/dossiers texte : utilisez `INGESTION_TEXT_PATHS="/chemin/a.txt,/chemin/vers/dossier"` et `INGESTION_SOURCES=text`.
+* Pour ingérer des mails Thunderbird locaux : définissez `INGESTION_SOURCES=text,thunderbird` et `THUNDERBIRD_PROFILE_DIR` vers le dossier de profil.
+* Pour ajouter régulièrement les nouveaux mails : définissez `INGESTION_REFRESH_INTERVAL=300` (ex. toutes les 5 minutes).
 
 ### Lancer le serveur
 
@@ -156,6 +164,23 @@ export OPENAI_API_BASE="https://api.openai.com/v1"           # ou votre passerel
 export OPENAI_API_KEY="sk-..."
 export API_AUTH_TOKEN="my-inbound-token"
 uvicorn app:app --host 0.0.0.0 --port 8080
+```
+
+### Lancer via `run.sh` (avec `.env`)
+
+Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`).
+
+```bash
+# Exemple minimal .env
+OPENAI_API_BASE="https://api.openai.com/v1"
+OPENAI_API_KEY="sk-..."
+API_AUTH_TOKEN="my-inbound-token"
+```
+
+Puis démarrez avec :
+
+```bash
+./run.sh 0.0.0.0 8080
 ```
 
 ---
