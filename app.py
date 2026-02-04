@@ -9,6 +9,7 @@ import logging
 import mailbox
 import email
 from collections import OrderedDict
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator, Set, Iterable
@@ -117,7 +118,7 @@ class LRUCache:
         self._cache: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
         self._max_size = max_size
         self._ttl = ttl
-        self._lock = asyncio.Lock() if asyncio.get_event_loop().is_running() else None
+        self._lock = threading.Lock()
     
     def _is_expired(self, timestamp: float) -> bool:
         if self._ttl is None:
@@ -125,27 +126,31 @@ class LRUCache:
         return time.time() - timestamp > self._ttl
     
     def get(self, key: str) -> Optional[Any]:
-        if key not in self._cache:
-            return None
-        value, timestamp = self._cache[key]
-        if self._is_expired(timestamp):
-            del self._cache[key]
-            return None
-        # Move to end (most recently used)
-        self._cache.move_to_end(key)
-        return value
+        with self._lock:
+            if key not in self._cache:
+                return None
+            value, timestamp = self._cache[key]
+            if self._is_expired(timestamp):
+                del self._cache[key]
+                return None
+            # Move to end (most recently used)
+            self._cache.move_to_end(key)
+            return value
     
     def set(self, key: str, value: Any) -> None:
-        # Remove oldest entries if at capacity
-        while len(self._cache) >= self._max_size:
-            self._cache.popitem(last=False)
-        self._cache[key] = (value, time.time())
+        with self._lock:
+            # Remove oldest entries if at capacity
+            while len(self._cache) >= self._max_size:
+                self._cache.popitem(last=False)
+            self._cache[key] = (value, time.time())
     
     def clear(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
     
     def __len__(self) -> int:
-        return len(self._cache)
+        with self._lock:
+            return len(self._cache)
     
     def __contains__(self, key: str) -> bool:
         return self.get(key) is not None
@@ -333,35 +338,40 @@ def _ensure_vectorstore():
         logger.info("Loading existing vector store...")
         try:
             with timer("load_faiss", "info"):
-                _vector = FAISS.load_local(
-                    VECTORSTORE_DIR, 
-                    _get_embeddings(), 
+                vector = FAISS.load_local(
+                    VECTORSTORE_DIR,
+                    _get_embeddings(),
                     allow_dangerous_deserialization=True
                 )
-            
+
             with open(chunks_path, "rb") as f:
-                _all_docs = pickle.load(f)
-            
+                docs = pickle.load(f)
+
+            bm25_retriever = None
             # Load or rebuild BM25
-            if ENABLE_HYBRID_SEARCH and _all_docs:
+            if ENABLE_HYBRID_SEARCH and docs:
                 if os.path.exists(bm25_path):
                     try:
                         with open(bm25_path, "rb") as f:
-                            _bm25_retriever = pickle.load(f)
-                        _bm25_retriever.k = BM25_K
+                            bm25_retriever = pickle.load(f)
+                        bm25_retriever.k = BM25_K
                         logger.info("Loaded BM25 index from cache.")
                     except Exception as e:
                         logger.warning(f"Failed to load BM25 cache: {e}. Rebuilding...")
-                        _bm25_retriever = BM25Retriever.from_documents(_all_docs)
-                        _bm25_retriever.k = BM25_K
+                        bm25_retriever = BM25Retriever.from_documents(docs)
+                        bm25_retriever.k = BM25_K
                 else:
                     with timer("build_bm25", "info"):
-                        _bm25_retriever = BM25Retriever.from_documents(_all_docs)
-                        _bm25_retriever.k = BM25_K
+                        bm25_retriever = BM25Retriever.from_documents(docs)
+                        bm25_retriever.k = BM25_K
                         # Save BM25 for next time
                         with open(bm25_path, "wb") as f:
-                            pickle.dump(_bm25_retriever, f)
-                            
+                            pickle.dump(bm25_retriever, f)
+
+            _vector = vector
+            _all_docs = docs
+            _bm25_retriever = bm25_retriever
+
             logger.info(f"Loaded {len(_all_docs)} document chunks.")
         except Exception as e:
             logger.error(f"Error loading index: {e}. Rebuilding...")
@@ -392,24 +402,27 @@ def _build_index():
     logger.info(f"Created {len(docs)} chunks from ingestion sources.")
 
     embeddings = _get_embeddings()
-    
+
     with timer("build_faiss", "info"):
-        _vector = FAISS.from_documents(docs, embeddings)
-        _vector.save_local(VECTORSTORE_DIR)
-    
-    _all_docs = docs
+        vector = FAISS.from_documents(docs, embeddings)
+        vector.save_local(VECTORSTORE_DIR)
     chunks_path = os.path.join(VECTORSTORE_DIR, "chunks.pkl")
     with open(chunks_path, "wb") as f:
         pickle.dump(docs, f)
     
+    bm25_retriever = None
     if ENABLE_HYBRID_SEARCH:
         with timer("build_bm25", "info"):
-            _bm25_retriever = BM25Retriever.from_documents(docs)
-            _bm25_retriever.k = BM25_K
+            bm25_retriever = BM25Retriever.from_documents(docs)
+            bm25_retriever.k = BM25_K
             # Cache BM25
             bm25_path = os.path.join(VECTORSTORE_DIR, "bm25.pkl")
             with open(bm25_path, "wb") as f:
-                pickle.dump(_bm25_retriever, f)
+                pickle.dump(bm25_retriever, f)
+
+    _vector = vector
+    _all_docs = docs
+    _bm25_retriever = bm25_retriever
     
     _last_ingestion_mtime = _get_ingestion_latest_mtime()
     logger.info("Index build complete.")
@@ -633,6 +646,26 @@ def _get_cache_key(*args) -> str:
     return hashlib.md5(combined.encode()).hexdigest()
 
 
+def _get_retrieval_cache_key(user_query: str, history_str: str) -> str:
+    """Generate a retrieval cache key that includes configuration."""
+    return _get_cache_key(
+        "retrieval",
+        user_query,
+        history_str[:200],
+        RAG_QUERY_STRATEGY,
+        RAG_TOP_K,
+        RAG_MIN_SCORE,
+        ENABLE_HYBRID_SEARCH,
+        ENABLE_RERANKING,
+        ENABLE_MMR,
+        MMR_K,
+        MMR_FETCH_K,
+        MMR_LAMBDA,
+        BM25_K,
+        UPSTREAM_MODEL_REWRITE,
+    )
+
+
 async def _call_upstream_llm(
     messages: List[Dict[str, str]], 
     model: str, 
@@ -735,7 +768,12 @@ async def _classify_query(query: str) -> str:
 
 async def _rewrite_query(history_str: str, current_query: str) -> str:
     """Generates a search-optimized query based on conversation context."""
-    cache_key = _get_cache_key("rewrite", history_str, current_query)
+    cache_key = _get_cache_key(
+        "rewrite",
+        history_str,
+        current_query,
+        UPSTREAM_MODEL_REWRITE,
+    )
     
     if ENABLE_CACHING and _query_rewrite_cache:
         cached = _query_rewrite_cache.get(cache_key)
@@ -781,7 +819,11 @@ async def _hyde_expand(query: str) -> Optional[str]:
     Generates a Hypothetical Document Embedding (HyDE).
     Returns None if generation fails.
     """
-    cache_key = _get_cache_key("hyde", query)
+    cache_key = _get_cache_key(
+        "hyde",
+        query,
+        UPSTREAM_MODEL_REWRITE,
+    )
     
     if ENABLE_CACHING and _hyde_cache:
         cached = _hyde_cache.get(cache_key)
@@ -969,7 +1011,7 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
         }
 
     # 2. Check retrieval cache
-    cache_key = _get_cache_key("retrieval", user_query, history_str[:200])
+    cache_key = _get_retrieval_cache_key(user_query, history_str)
     if ENABLE_CACHING and _retrieval_cache:
         cached = _retrieval_cache.get(cache_key)
         if cached:
