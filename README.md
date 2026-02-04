@@ -49,27 +49,33 @@ flowchart LR
         direction TB
         ensure["Chargement/MAJ index<br/>FAISS + BM25"]
         classify["Classification rapide<br/>RAG vs CHAT (optionnelle)"]
-        original["Recherche immédiate<br/>similarity_search(q)<br/>+ BM25 (optionnel)"]
+        cache["Cache retrieval ?"]
+        original["Recherche immédiate<br/>FAISS MMR (q)<br/>+ BM25 (optionnel)"]
         rewrite["Réécriture requête (q')<br/>UPSTREAM_MODEL_REWRITE"]
         hyde["HyDE (h)<br/>pseudo-document"]
-        search_rewrite["Recherche q'"]
-        search_hyde["Recherche h"]
+        search_rewrite["Recherche q'<br/>FAISS MMR"]
+        search_hyde["Recherche h<br/>FAISS similarity"]
         fusion["Fusion RRF"]
         dedup["Déduplication rapide"]
         rerank["Reranking CrossEncoder<br/>(optionnel)"]
         topk["Sélection top‑K + formatage"]
+        empty_ctx["Aucun chunk<br/>→ contexte vide"]
         prompt["Contexte + historique<br/>→ prompt final"]
         rag_call["Appel UPSTREAM_MODEL_RAG"]
         fallback["Fallback chat (sans contexte)"]
         ensure --> classify
         classify -->|CHAT| fallback
-        classify -->|RAG| original
+        classify -->|RAG| cache
+        cache -->|hit| prompt
+        cache -->|miss| original
         original --> fusion
         rewrite --> search_rewrite
         hyde --> search_hyde
         search_rewrite --> fusion
         search_hyde --> fusion
-        fusion --> dedup --> rerank --> topk --> prompt --> rag_call
+        fusion --> dedup --> rerank --> topk
+        topk -->|0 doc| empty_ctx --> prompt
+        topk -->|docs| prompt --> rag_call
     end
 
     dispatch -->|ai-rag| ensure
