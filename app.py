@@ -8,6 +8,7 @@ import pickle
 import logging
 import mailbox
 import email
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator, Set, Iterable
@@ -117,9 +118,9 @@ _refresh_task: Optional[asyncio.Task] = None
 _last_ingestion_mtime: Optional[float] = None
 
 # Simple in-memory LRU-like caches
-_embedding_cache: Dict[str, List[float]] = {}
-_query_rewrite_cache: Dict[str, str] = {}
-_hyde_cache: Dict[str, str] = {}
+_embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
+_query_rewrite_cache: "OrderedDict[str, str]" = OrderedDict()
+_hyde_cache: "OrderedDict[str, str]" = OrderedDict()
 
 
 # ===============================
@@ -462,6 +463,30 @@ def check_auth(authorization: str = Header(None)):
 def _get_cache_key(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
+
+def _cache_get(cache: "OrderedDict[str, Any]", key: str) -> Optional[Any]:
+    if not ENABLE_CACHING:
+        return None
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    return None
+
+
+def _cache_set(cache: "OrderedDict[str, Any]", key: str, value: Any) -> None:
+    if not ENABLE_CACHING:
+        return
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > CACHE_MAX_SIZE:
+        cache.popitem(last=False)
+
+
+async def _get_http_client() -> Tuple[httpx.AsyncClient, bool]:
+    if _http_client is not None:
+        return _http_client, False
+    return httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=20)), True
+
 async def _call_upstream_llm(
     messages: List[Dict[str, str]], 
     model: str, 
@@ -478,13 +503,17 @@ async def _call_upstream_llm(
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     
+    client, should_close = await _get_http_client()
     try:
-        resp = await _http_client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
+        resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
         logger.error(f"LLM Call failed: {e}")
         return ""
+    finally:
+        if should_close:
+            await client.aclose()
 
 
 # ===============================
@@ -501,8 +530,9 @@ async def _classify_query(query: str) -> str:
 async def _rewrite_query(history_str: str, current_query: str) -> str:
     """Generates a search-optimized query."""
     cache_key = _get_cache_key(f"{history_str}|{current_query}")
-    if ENABLE_CACHING and cache_key in _query_rewrite_cache:
-        return _query_rewrite_cache[cache_key]
+    cached = _cache_get(_query_rewrite_cache, cache_key)
+    if cached is not None:
+        return cached
 
     system = "You are a search query optimizer. Output ONLY the improved search query, no explanation."
     prompt = f"Context: {history_str}\nUser Question: {current_query}\nOptimized Search Query:"
@@ -514,15 +544,16 @@ async def _rewrite_query(history_str: str, current_query: str) -> str:
     )
     
     result = rewritten.strip() if rewritten else current_query
-    if ENABLE_CACHING: _query_rewrite_cache[cache_key] = result
+    _cache_set(_query_rewrite_cache, cache_key, result)
     return result
 
 
 async def _hyde_expand(query: str) -> str:
     """Generates a hypothetical document."""
     cache_key = _get_cache_key(f"hyde|{query}")
-    if ENABLE_CACHING and cache_key in _hyde_cache:
-        return _hyde_cache[cache_key]
+    cached = _cache_get(_hyde_cache, cache_key)
+    if cached is not None:
+        return cached
 
     system = "Write a short, factual 3-sentence excerpt from a technical manual answering this question."
     hyde_doc = await _call_upstream_llm(
@@ -531,7 +562,7 @@ async def _hyde_expand(query: str) -> str:
         max_tokens=128
     )
     
-    if ENABLE_CACHING: _hyde_cache[cache_key] = hyde_doc
+    _cache_set(_hyde_cache, cache_key, hyde_doc)
     return hyde_doc
 
 
@@ -790,9 +821,13 @@ async def chat_endpoint(req: ChatReq):
         }
 
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-        async with httpx.AsyncClient() as client:
+        client, should_close = await _get_http_client()
+        try:
             resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
             data = resp.json()
+        finally:
+            if should_close:
+                await client.aclose()
             
         content = data["choices"][0]["message"]["content"]
         if rag_result["sources"]:
@@ -817,8 +852,8 @@ async def _stream_generator(messages, req, sources):
         "stream": True
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    
-    async with httpx.AsyncClient() as client:
+    client, should_close = await _get_http_client()
+    try:
         async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers) as resp:
             async for line in resp.aiter_lines():
                 if line.startswith("data: ") and line != "data: [DONE]":
@@ -827,7 +862,11 @@ async def _stream_generator(messages, req, sources):
                         # Clean up model name in response
                         data["model"] = MODEL_RAG_NAME
                         yield f"data: {json.dumps(data)}\n\n"
-                    except: pass
+                    except Exception:
+                        pass
+    finally:
+        if should_close:
+            await client.aclose()
     
     # Append sources at the end
     if sources:
