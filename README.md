@@ -85,6 +85,47 @@ flowchart LR
     stream --> client
 ```
 
+### (A) Router / Decision Flow
+
+```mermaid
+flowchart TD
+    client((Client)) --> req["/v1/chat/completions"]
+    req --> auth{Token valide ?}
+    auth -->|non| err401[401 Unauthorized]
+    auth -->|oui| model{model}
+    model -->|ai-rag| rag["Pipeline RAG"]
+    model -->|autre| err400[400 Modèle inconnu]
+    rag --> classify{RAG vs CHAT ?}
+    classify -->|CHAT| fallback["Fallback chat\n(sans contexte)"]
+    classify -->|RAG| retrieve["Retrieval + fusion\n(RRF/dedup/rerank)"]
+    retrieve --> topk{chunks ?}
+    topk -->|0| empty_ctx["Contexte vide"]
+    topk -->|>0| ctx["Contexte enrichi"]
+    empty_ctx --> prompt["Prompt final"]
+    ctx --> prompt
+    fallback --> prompt
+    prompt --> upstream["Appel modèle amont"]
+    upstream --> response["Réponse + Sources"]
+```
+
+### (B) Séquence critique : aucun chunk pertinent (contexte vide)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API RAG
+    participant VS as Vectorstore/FAISS
+    participant LLM as Modèle amont
+    C->>API: POST /v1/chat/completions (ai-rag)
+    API->>API: Auth + validation modèle
+    API->>VS: Retrieval (q, q', h)
+    VS-->>API: 0 résultat pertinent
+    API->>API: Contexte vide + prompt minimal
+    API->>LLM: Appel UPSTREAM_MODEL_RAG
+    LLM-->>API: Réponse courte
+    API-->>C: Réponse + "Sources: (aucune)"
+```
+
 ### Détails étape par étape
 
 0. **Vectorstore** (`_ensure_vectorstore`) : charge `vectorstore_db/` (index FAISS + `chunks.pkl`), le reconstruit si absent, si `RAG_FORCE_REBUILD=on`, ou si les sources d’ingestion sont plus récentes.
