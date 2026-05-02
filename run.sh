@@ -15,9 +15,7 @@ ${pythonVersion} -m venv "${pythonDir}"
 source "${pythonDir}"/bin/activate
 
 #intall
-${pythonVersion} -m pip cache purge
-${pythonVersion} -m pip install -U pip setuptools wheel
-${pythonVersion} -m pip install -U -r requirements.txt
+#${pythonVersion} -m pip cache purge ; ${pythonVersion} -m pip install -U pip wheel ; ${pythonVersion} -m pip install -U -r requirements.txt
 #optimize space
 #(jdupes -X size+:99M -r -L ~ >/dev/null 2>&1 )&
 
@@ -46,5 +44,5 @@ fi
 
 #${pythonVersion} app.py $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
 #${pythonVersion} -m streamlit run app.py --browser.gatherUsageStats false $([ ! -z "${serverAddress}" ] && echo --server.address ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --server.port ${portNumber})
-${pythonVersion} -m uvicorn app:app --reload $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
+${pythonVersion} -m uvicorn app:app $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
 #${pythonVersion} back.py
