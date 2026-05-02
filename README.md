@@ -164,6 +164,7 @@ sequenceDiagram
 | Variable | Défaut | Description |
 | --- | --- | --- |
 | `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible en amont. |
+| `EMBEDDINGS_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée embeddings (optionnelle), suffixée automatiquement par `/embeddings`. |
 | `OPENAI_API_KEY` | `changeme` | Clé API pour l’amont. |
 | `API_AUTH_TOKEN` | *(vide)* | Si défini : **obligatoire** en entrée via `Authorization: Bearer …`. |
 | `UPSTREAM_MODEL_RAG` | `gpt-4o-mini` | Modèle amont pour la génération RAG. |
@@ -180,12 +181,62 @@ sequenceDiagram
 | `RAG_TOP_K` | `8` | Nombre max de chunks concaténés dans le contexte. |
 | `RAG_QUERY_STRATEGY` | `rewrite+hyde` | `simple`, `rewrite`, `hyde` ou `rewrite+hyde`. |
 | `RAG_HISTORY_WINDOW` | `6` | Nb. de messages conservés pour le prompt final. |
-| `ENABLE_HYBRID_SEARCH` | `true` | Active la recherche BM25 hybride. |
-| `ENABLE_RERANKING` | `true` | Active le reranking CrossEncoder. |
+| `ENABLE_HYBRID_SEARCH` | `false` | Active la recherche BM25 hybride. |
+| `ENABLE_RERANKING` | `false` | Active le reranking CrossEncoder local (optionnel). |
 | `ENABLE_QUERY_CLASSIFICATION` | `true` | Active la classification rapide RAG vs CHAT. |
-| `EMBEDDING_MODEL` | `BAAI/bge-m3` | Modèle d’embeddings utilisé. |
+| `EMBEDDING_BACKEND` | `external` | Backend embeddings: `external` (API `/v1/embeddings`) ou `local` (HuggingFace). |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | Modèle d’embeddings utilisé (nom envoyé à l’API externe ou chargé localement). |
+| `EMBEDDING_DEVICE` | `cpu` | Device embeddings (`cpu`, `cuda`, `mps`). Par défaut CPU pour éviter l’usage VRAM. |
+| `RERANKING_BACKEND` | `external` | Backend reranking: `external` (API `/rerank`) ou `local` (CrossEncoder). |
+| `RERANKING_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée reranking (optionnelle), suffixée automatiquement par `/rerank`. |
+| `RERANKER_DEVICE` | `cpu` | Device reranker (`cpu`, `cuda`, `mps`). Par défaut CPU pour éviter l’usage VRAM. |
 | `BM25_K` | `4` | Nombre de résultats BM25 pris en compte. |
 | `PORT` | `8080` | Port HTTP local. |
+
+### Protocole attendu pour le reranking externe
+
+Quand `ENABLE_RERANKING=true` et `RERANKING_BACKEND=external`, le serveur appelle:
+
+* `POST {RERANKING_API_BASE}/rerank`
+* Header: `Authorization: Bearer {OPENAI_API_KEY}` (si clé définie)
+* `Content-Type: application/json`
+
+Payload envoyé:
+
+```json
+{
+  "model": "BAAI/bge-reranker-v2-m3",
+  "query": "texte de la question",
+  "documents": ["doc1", "doc2", "doc3"]
+}
+```
+
+Formats de réponse acceptés:
+
+```json
+{
+  "results": [
+    {"index": 1, "relevance_score": 0.98},
+    {"index": 0, "relevance_score": 0.73}
+  ]
+}
+```
+
+ou
+
+```json
+{
+  "data": [
+    {"index": 1, "score": 0.98},
+    {"index": 0, "score": 0.73}
+  ]
+}
+```
+
+Notes:
+* `index` référence la position du document dans `documents`.
+* Si `index` est absent, l’ordre retourné est utilisé.
+* Si la réponse est vide/invalide, le pipeline garde l’ordre initial (pas de crash).
 
 ---
 
