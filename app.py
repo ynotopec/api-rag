@@ -23,6 +23,7 @@ from pydantic import BaseModel
 # LangChain / RAG Imports
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.retrievers import BM25Retriever
@@ -83,7 +84,7 @@ HISTORY_WINDOW = int(os.getenv("RAG_HISTORY_WINDOW", "6"))
 
 # Optimization Flags
 ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
-ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
+ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "false").lower() == "true"
 ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "true").lower() == "true"
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
 
@@ -96,6 +97,9 @@ MMR_K = int(os.getenv("MMR_K", "8"))
 MMR_FETCH_K = int(os.getenv("MMR_FETCH_K", "16"))
 BM25_K = int(os.getenv("BM25_K", "4"))
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "external").strip().lower()
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+OPENAI_EMBEDDINGS_URL = OPENAI_API_BASE.rstrip("/") + "/embeddings"
 #cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # System Resources
@@ -121,6 +125,34 @@ _last_ingestion_mtime: Optional[float] = None
 _embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
 _query_rewrite_cache: "OrderedDict[str, str]" = OrderedDict()
 _hyde_cache: "OrderedDict[str, str]" = OrderedDict()
+
+
+class ExternalAPIEmbeddings(Embeddings):
+    """Embeddings provider backed by OpenAI-compatible /v1/embeddings API."""
+
+    def __init__(self, model: str):
+        self.model = model
+        self.url = OPENAI_EMBEDDINGS_URL
+        self.api_key = OPENAI_API_KEY
+
+    def _embed(self, inputs: List[str]) -> List[List[float]]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload = {"model": self.model, "input": inputs}
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(self.url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+        return [item["embedding"] for item in data]
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        return self._embed(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed([text])[0]
 
 
 # ===============================
@@ -164,30 +196,34 @@ async def lifespan(app: FastAPI):
         _executor.shutdown(wait=False)
 
 
-def _get_embeddings() -> HuggingFaceEmbeddings:
+def _get_embeddings():
     global _embeddings
     if _embeddings is not None:
         return _embeddings
 
-    model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
-    logger.info(f"Loading embedding model: {model_name}")
-    
-    # Intelligent device selection
-    import torch
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps" # Apple Silicon
-    
-    logger.info(f"Using device: {device}")
+    if EMBEDDING_BACKEND == "external":
+        logger.info(f"Using external embeddings backend via {OPENAI_EMBEDDINGS_URL} (model={EMBEDDING_MODEL})")
+        emb = ExternalAPIEmbeddings(model=EMBEDDING_MODEL)
+        _embeddings = emb
+        return emb
 
+    if EMBEDDING_BACKEND != "local":
+        logger.warning(f"Invalid EMBEDDING_BACKEND='{EMBEDDING_BACKEND}', falling back to 'external'.")
+        emb = ExternalAPIEmbeddings(model=EMBEDDING_MODEL)
+        _embeddings = emb
+        return emb
+
+    logger.info(f"Loading local embedding model: {EMBEDDING_MODEL}")
+    device = os.getenv("EMBEDDING_DEVICE", "cpu").strip().lower()
+    if device not in {"cpu", "cuda", "mps"}:
+        logger.warning(f"Invalid EMBEDDING_DEVICE='{device}', falling back to 'cpu'.")
+        device = "cpu"
+    logger.info(f"Using local embedding device: {device}")
     encode_kwargs = {'normalize_embeddings': True, 'batch_size': 32}
-    
     emb = HuggingFaceEmbeddings(
-        model_name=model_name,
+        model_name=EMBEDDING_MODEL,
         model_kwargs={'device': device},
-        encode_kwargs=encode_kwargs
+        encode_kwargs=encode_kwargs,
     )
     _embeddings = emb
     return emb
@@ -200,8 +236,12 @@ def _get_reranker():
     if not RERANKER_AVAILABLE:
         return None
     try:
-        logger.info(f"Loading Reranker: {RERANKER_MODEL}")
-        _reranker = CrossEncoder(RERANKER_MODEL)
+        reranker_device = os.getenv("RERANKER_DEVICE", "cpu").strip().lower()
+        if reranker_device not in {"cpu", "cuda", "mps"}:
+            logger.warning(f"Invalid RERANKER_DEVICE='{reranker_device}', falling back to 'cpu'.")
+            reranker_device = "cpu"
+        logger.info(f"Loading Reranker: {RERANKER_MODEL} on device={reranker_device}")
+        _reranker = CrossEncoder(RERANKER_MODEL, device=reranker_device)
         return _reranker
     except Exception as e:
         logger.error(f"Failed to load reranker: {e}")

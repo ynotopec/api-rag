@@ -181,9 +181,12 @@ sequenceDiagram
 | `RAG_QUERY_STRATEGY` | `rewrite+hyde` | `simple`, `rewrite`, `hyde` ou `rewrite+hyde`. |
 | `RAG_HISTORY_WINDOW` | `6` | Nb. de messages conservés pour le prompt final. |
 | `ENABLE_HYBRID_SEARCH` | `true` | Active la recherche BM25 hybride. |
-| `ENABLE_RERANKING` | `true` | Active le reranking CrossEncoder. |
+| `ENABLE_RERANKING` | `false` | Active le reranking CrossEncoder local (optionnel). |
 | `ENABLE_QUERY_CLASSIFICATION` | `true` | Active la classification rapide RAG vs CHAT. |
-| `EMBEDDING_MODEL` | `BAAI/bge-m3` | Modèle d’embeddings utilisé. |
+| `EMBEDDING_BACKEND` | `external` | Backend embeddings: `external` (API `/v1/embeddings`) ou `local` (HuggingFace). |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | Modèle d’embeddings utilisé (nom envoyé à l’API externe ou chargé localement). |
+| `EMBEDDING_DEVICE` | `cpu` | Device embeddings (`cpu`, `cuda`, `mps`). Par défaut CPU pour éviter l’usage VRAM. |
+| `RERANKER_DEVICE` | `cpu` | Device reranker (`cpu`, `cuda`, `mps`). Par défaut CPU pour éviter l’usage VRAM. |
 | `BM25_K` | `4` | Nombre de résultats BM25 pris en compte. |
 | `PORT` | `8080` | Port HTTP local. |
 
