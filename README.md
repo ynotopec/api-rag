@@ -193,6 +193,51 @@ sequenceDiagram
 | `BM25_K` | `4` | Nombre de résultats BM25 pris en compte. |
 | `PORT` | `8080` | Port HTTP local. |
 
+### Protocole attendu pour le reranking externe
+
+Quand `ENABLE_RERANKING=true` et `RERANKING_BACKEND=external`, le serveur appelle:
+
+* `POST {RERANKING_API_BASE}/rerank`
+* Header: `Authorization: Bearer {OPENAI_API_KEY}` (si clé définie)
+* `Content-Type: application/json`
+
+Payload envoyé:
+
+```json
+{
+  "model": "BAAI/bge-reranker-v2-m3",
+  "query": "texte de la question",
+  "documents": ["doc1", "doc2", "doc3"]
+}
+```
+
+Formats de réponse acceptés:
+
+```json
+{
+  "results": [
+    {"index": 1, "relevance_score": 0.98},
+    {"index": 0, "relevance_score": 0.73}
+  ]
+}
+```
+
+ou
+
+```json
+{
+  "data": [
+    {"index": 1, "score": 0.98},
+    {"index": 0, "score": 0.73}
+  ]
+}
+```
+
+Notes:
+* `index` référence la position du document dans `documents`.
+* Si `index` est absent, l’ordre retourné est utilisé.
+* Si la réponse est vide/invalide, le pipeline garde l’ordre initial (pas de crash).
+
 ---
 
 ## 🚀 Démarrage rapide
