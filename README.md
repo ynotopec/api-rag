@@ -164,7 +164,7 @@ sequenceDiagram
 | Variable | Défaut | Description |
 | --- | --- | --- |
 | `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible en amont. |
-| `OPENAI_EMBEDDINGS_URL` | `OPENAI_API_BASE + "/embeddings"` | URL embeddings explicite (optionnel). |
+| `EMBEDDINGS_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée embeddings (optionnelle), suffixée automatiquement par `/embeddings`. |
 | `OPENAI_API_KEY` | `changeme` | Clé API pour l’amont. |
 | `API_AUTH_TOKEN` | *(vide)* | Si défini : **obligatoire** en entrée via `Authorization: Bearer …`. |
 | `UPSTREAM_MODEL_RAG` | `gpt-4o-mini` | Modèle amont pour la génération RAG. |

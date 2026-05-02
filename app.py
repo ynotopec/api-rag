@@ -99,7 +99,8 @@ BM25_K = int(os.getenv("BM25_K", "4"))
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "external").strip().lower()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
-OPENAI_EMBEDDINGS_URL = os.getenv("OPENAI_EMBEDDINGS_URL", OPENAI_API_BASE.rstrip("/") + "/embeddings")
+EMBEDDINGS_API_BASE = os.getenv("EMBEDDINGS_API_BASE", OPENAI_API_BASE).rstrip("/")
+OPENAI_EMBEDDINGS_URL = EMBEDDINGS_API_BASE + "/embeddings"
 #cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # System Resources
