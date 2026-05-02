@@ -83,7 +83,7 @@ RAG_QUERY_STRATEGY = os.getenv("RAG_QUERY_STRATEGY", "rewrite+hyde")
 HISTORY_WINDOW = int(os.getenv("RAG_HISTORY_WINDOW", "6"))
 
 # Optimization Flags
-ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
+ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "false").lower() == "true"
 ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "false").lower() == "true"
 ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "true").lower() == "true"
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
@@ -97,10 +97,13 @@ MMR_K = int(os.getenv("MMR_K", "8"))
 MMR_FETCH_K = int(os.getenv("MMR_FETCH_K", "16"))
 BM25_K = int(os.getenv("BM25_K", "4"))
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANKING_BACKEND = os.getenv("RERANKING_BACKEND", "external").strip().lower()
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "external").strip().lower()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 EMBEDDINGS_API_BASE = os.getenv("EMBEDDINGS_API_BASE", OPENAI_API_BASE).rstrip("/")
 OPENAI_EMBEDDINGS_URL = EMBEDDINGS_API_BASE + "/embeddings"
+RERANKING_API_BASE = os.getenv("RERANKING_API_BASE", OPENAI_API_BASE).rstrip("/")
+OPENAI_RERANKING_URL = RERANKING_API_BASE + "/rerank"
 #cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # System Resources
@@ -234,6 +237,13 @@ def _get_reranker():
     global _reranker
     if _reranker is not None:
         return _reranker
+    if RERANKING_BACKEND == "external":
+        logger.info(f"Using external reranking backend via {OPENAI_RERANKING_URL} (model={RERANKER_MODEL})")
+        _reranker = "external"
+        return _reranker
+    if RERANKING_BACKEND != "local":
+        logger.warning(f"Invalid RERANKING_BACKEND='{RERANKING_BACKEND}', reranking disabled.")
+        return None
     if not RERANKER_AVAILABLE:
         return None
     try:
@@ -665,6 +675,32 @@ def _rerank_documents(query: str, docs: List[Document]) -> List[Document]:
         return docs
 
     try:
+        if _reranker == "external":
+            headers = {"Content-Type": "application/json"}
+            if OPENAI_API_KEY:
+                headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+            payload = {
+                "model": RERANKER_MODEL,
+                "query": query,
+                "documents": [d.page_content for d in docs],
+            }
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(OPENAI_RERANKING_URL, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+
+            results = data.get("results") or data.get("data") or []
+            scored = []
+            for idx, item in enumerate(results):
+                doc_idx = item.get("index", idx)
+                score = item.get("relevance_score", item.get("score", 0.0))
+                if isinstance(doc_idx, int) and 0 <= doc_idx < len(docs):
+                    scored.append((docs[doc_idx], float(score)))
+            if not scored:
+                return docs
+            ranked = sorted(scored, key=lambda x: x[1], reverse=True)
+            return [d for d, _ in ranked]
+
         pairs = [(query, d.page_content) for d in docs]
         scores = _reranker.predict(pairs)
         ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
