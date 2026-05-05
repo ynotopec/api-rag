@@ -504,7 +504,8 @@ class ChatReq(BaseModel):
     temperature: Optional[float] = 0.2
     stream: Optional[bool] = False
     include_chunks: Optional[bool] = False
-    include_citations: Optional[bool] = True
+    include_citations: Optional[bool] = False
+    include_sources: Optional[bool] = False
     max_tokens: Optional[int] = None
     top_p: Optional[float] = 1.0
 
@@ -999,7 +1000,7 @@ async def chat_endpoint(req: ChatReq):
             chunk_text = _format_chunks_trace(rag_result.get("chunks", []))
             if chunk_text:
                 content += f"\n\n{chunk_text}"
-        if rag_result["sources"] and not _contains_sources_block(content):
+        if req.include_sources and rag_result["sources"] and not _contains_sources_block(content):
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
 
         message: Dict[str, Any] = {"role": "assistant", "content": content}
@@ -1093,7 +1094,7 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
         }
         yield f"data: {json.dumps(refs_chunk)}\n\n"
 
-    if sources and not _contains_sources_block(streamed_text):
+    if req.include_sources and sources and not _contains_sources_block(streamed_text):
         src_text = f"\n\nSources: {', '.join(sources)}"
         chunk = {
             "id": "sources",
