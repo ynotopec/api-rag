@@ -503,8 +503,21 @@ class ChatReq(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
     stream: Optional[bool] = False
+    include_chunks: Optional[bool] = True
     max_tokens: Optional[int] = None
     top_p: Optional[float] = 1.0
+
+
+def _format_chunks_trace(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return ""
+    lines = ["Chunks utilisés:"]
+    for chunk in chunks:
+        idx = chunk.get("rank", "?")
+        source = chunk.get("source", "unknown")
+        excerpt = chunk.get("excerpt", "")
+        lines.append(f"- [{idx}] ({source}) {excerpt}")
+    return "\n".join(lines)
 
 def check_auth(authorization: str = Header(None)):
     if AUTH_TOKEN:
@@ -820,10 +833,18 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
 
     # On ajoute des marqueurs clairs pour que le LLM sache que ce sont des morceaux distincts
     formatted_chunks = []
+    chunks_trace: List[Dict[str, Any]] = []
     for i, doc in enumerate(final_docs):
         # Petit nettoyage : retirer les sauts de ligne excessifs dans le chunk lui-même
         clean_content = " ".join(doc.page_content.split())
         formatted_chunks.append(f"[Excerpt {i+1}]: {clean_content}")
+        chunks_trace.append(
+            {
+                "rank": i + 1,
+                "source": doc.metadata.get("source", "unknown"),
+                "excerpt": clean_content,
+            }
+        )
 
 #    context_text = "\n\n".join([d.page_content for d in final_docs])
     context_text = "\n\n".join(formatted_chunks)
@@ -832,6 +853,7 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
     return {
         "context": context_text,
         "sources": sources,
+        "chunks": chunks_trace,
         "skip": False,
         "query": rewritten_query
     }
@@ -890,7 +912,7 @@ async def chat_endpoint(req: ChatReq):
     # 3. Stream or Return
     if req.stream:
         return StreamingResponse(
-            _stream_generator(final_messages, req, rag_result["sources"]),
+            _stream_generator(final_messages, req, rag_result["sources"], rag_result.get("chunks", []), bool(req.include_chunks)),
             media_type="text/event-stream"
         )
     else:
@@ -921,6 +943,10 @@ async def chat_endpoint(req: ChatReq):
                 await client.aclose()
             
         content = data["choices"][0]["message"]["content"]
+        if req.include_chunks:
+            chunk_text = _format_chunks_trace(rag_result.get("chunks", []))
+            if chunk_text:
+                content += f"\n\n{chunk_text}"
         if rag_result["sources"]:
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
             
@@ -932,7 +958,7 @@ async def chat_endpoint(req: ChatReq):
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
         }
 
-async def _stream_generator(messages, req, sources):
+async def _stream_generator(messages, req, sources, chunks, include_chunks: bool):
     """Yields SSE events."""
     payload = {
         "model": UPSTREAM_MODEL_RAG,
@@ -978,7 +1004,19 @@ async def _stream_generator(messages, req, sources):
         if should_close:
             await client.aclose()
     
-    # Append sources at the end
+    # Append chunk trace and sources at the end
+    if include_chunks:
+        chunk_text = _format_chunks_trace(chunks)
+        if chunk_text:
+            chunk = {
+                "id": "chunks",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": MODEL_RAG_NAME,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n{chunk_text}"}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
     if sources:
         src_text = f"\n\nSources: {', '.join(sources)}"
         chunk = {
