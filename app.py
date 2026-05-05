@@ -130,6 +130,7 @@ _last_ingestion_mtime: Optional[float] = None
 _embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
 _query_rewrite_cache: "OrderedDict[str, str]" = OrderedDict()
 _hyde_cache: "OrderedDict[str, str]" = OrderedDict()
+_extract_store: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
 
 class ExternalAPIEmbeddings(Embeddings):
@@ -503,8 +504,102 @@ class ChatReq(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
     stream: Optional[bool] = False
+    include_chunks: Optional[bool] = False
+    include_citations: Optional[bool] = False
+    include_sources: Optional[bool] = False
     max_tokens: Optional[int] = None
     top_p: Optional[float] = 1.0
+
+
+_chunks_trace_cache: "OrderedDict[str, str]" = OrderedDict()
+
+
+def _format_chunks_trace(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return ""
+
+    cache_key = _get_cache_key(json.dumps(chunks, sort_keys=True, ensure_ascii=False))
+    cached = _cache_get(_chunks_trace_cache, cache_key)
+    if cached is not None:
+        return cached
+
+    lines = ["### Chunks utilisés"]
+    for chunk in chunks:
+        idx = chunk.get("rank", "?")
+        source = chunk.get("source", "unknown")
+        excerpt = str(chunk.get("excerpt", "")).replace("\n", " ").strip()
+        if len(excerpt) > 320:
+            excerpt = excerpt[:317].rstrip() + "..."
+        lines.append(f"- **[{idx}]** `{source}`  ")
+        lines.append(f"  > {excerpt}")
+
+    result = "\n".join(lines)
+    _cache_set(_chunks_trace_cache, cache_key, result)
+    return result
+
+
+def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    refs = []
+    for chunk in chunks:
+        source_name = chunk.get("source", "unknown")
+        source_url = chunk.get("url", "")
+        page = chunk.get("page", "")
+        excerpt = chunk.get("excerpt", "")
+        confidence = chunk.get("confidence", None)
+        score = chunk.get("score", None)
+        source_obj = {"name": source_name}
+        if source_url:
+            source_obj["url"] = source_url
+        if page != "":
+            source_obj["page"] = page
+        refs.append(
+            {
+                "document": [excerpt],
+                "metadata": [
+                    {
+                        "source": source_name,
+                        "rank": chunk.get("rank", "?"),
+                        "score": score,
+                        "confidence": confidence,
+                        "page": page,
+                    }
+                ],
+                "source": source_obj,
+            }
+        )
+    return refs
+
+
+def _contains_sources_block(text: str) -> bool:
+    return "Sources:" in text or "Source:" in text
+
+
+def _store_extracts(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        extract_id = hashlib.md5(
+            f"{chunk.get('source','')}|{chunk.get('page','')}|{chunk.get('excerpt','')}".encode("utf-8")
+        ).hexdigest()
+        _extract_store[extract_id] = {
+            "page_content": chunk.get("excerpt", ""),
+            "source": chunk.get("source", "unknown"),
+            "url": chunk.get("url", ""),
+            "page": chunk.get("page", ""),
+            "score": chunk.get("score", None),
+            "confidence": chunk.get("confidence", None),
+        }
+        if len(_extract_store) > CACHE_MAX_SIZE:
+            _extract_store.popitem(last=False)
+        sources.append(
+            {
+                "_id": extract_id,
+                "filename": chunk.get("source", "unknown"),
+                "page": chunk.get("page", ""),
+                "file_url": chunk.get("url", ""),
+                "relevance_score": chunk.get("confidence", chunk.get("score", 0.0)) or 0.0,
+            }
+        )
+    return sources
 
 def check_auth(authorization: str = Header(None)):
     if AUTH_TOKEN:
@@ -736,12 +831,15 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
     async def search_original():
         res = []
         if _vector:
-            res.extend(await asyncio.get_event_loop().run_in_executor(
+            scored = await asyncio.get_event_loop().run_in_executor(
                 _executor, 
                 lambda: _vector.similarity_search_with_score(user_query, k=MMR_K)
-            ))
-            # Unwrap tuple (doc, score) -> doc
-            res = [r[0] for r in res]
+            )
+            for doc, score in scored:
+                doc.metadata["_retrieval_score"] = float(score)
+                # FAISS distance -> confidence-like score in [0,1]
+                doc.metadata["_retrieval_confidence"] = 1.0 / (1.0 + max(float(score), 0.0))
+                res.append(doc)
         if ENABLE_HYBRID_SEARCH and _bm25_retriever:
              res.extend(await asyncio.get_event_loop().run_in_executor(
                 _executor, _bm25_retriever.invoke, user_query
@@ -820,10 +918,22 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
 
     # On ajoute des marqueurs clairs pour que le LLM sache que ce sont des morceaux distincts
     formatted_chunks = []
+    chunks_trace: List[Dict[str, Any]] = []
     for i, doc in enumerate(final_docs):
         # Petit nettoyage : retirer les sauts de ligne excessifs dans le chunk lui-même
         clean_content = " ".join(doc.page_content.split())
         formatted_chunks.append(f"[Excerpt {i+1}]: {clean_content}")
+        chunks_trace.append(
+            {
+                "rank": i + 1,
+                "source": doc.metadata.get("source", "unknown"),
+                "url": doc.metadata.get("url") or doc.metadata.get("link") or "",
+                "page": doc.metadata.get("page", ""),
+                "score": doc.metadata.get("_retrieval_score", None),
+                "confidence": doc.metadata.get("_retrieval_confidence", None),
+                "excerpt": clean_content,
+            }
+        )
 
 #    context_text = "\n\n".join([d.page_content for d in final_docs])
     context_text = "\n\n".join(formatted_chunks)
@@ -832,6 +942,7 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
     return {
         "context": context_text,
         "sources": sources,
+        "chunks": chunks_trace,
         "skip": False,
         "query": rewritten_query
     }
@@ -847,6 +958,14 @@ def health():
 @app.get("/v1/models")
 def list_models():
     return {"data": [{"id": MODEL_RAG_NAME, "object": "model"}]}
+
+
+@app.get("/extract/{extract_id}")
+def get_extract(extract_id: str):
+    item = _extract_store.get(extract_id)
+    if not item:
+        raise HTTPException(404, "Extract not found")
+    return {"id": extract_id, **item}
 
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
 async def chat_endpoint(req: ChatReq):
@@ -890,7 +1009,14 @@ async def chat_endpoint(req: ChatReq):
     # 3. Stream or Return
     if req.stream:
         return StreamingResponse(
-            _stream_generator(final_messages, req, rag_result["sources"]),
+            _stream_generator(
+                final_messages,
+                req,
+                rag_result["sources"],
+                rag_result.get("chunks", []),
+                bool(req.include_chunks),
+                bool(req.include_citations),
+            ),
             media_type="text/event-stream"
         )
     else:
@@ -921,18 +1047,31 @@ async def chat_endpoint(req: ChatReq):
                 await client.aclose()
             
         content = data["choices"][0]["message"]["content"]
-        if rag_result["sources"]:
+        if req.include_chunks:
+            chunk_text = _format_chunks_trace(rag_result.get("chunks", []))
+            if chunk_text:
+                content += f"\n\n{chunk_text}"
+        if req.include_sources and rag_result["sources"] and not _contains_sources_block(content):
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
+
+        message: Dict[str, Any] = {"role": "assistant", "content": content}
+        citations_payload: List[Dict[str, Any]] = []
+        if req.include_citations:
+            citations_payload = _build_citations(rag_result.get("chunks", []))
+            message["citations"] = citations_payload
+        extra_payload = {"sources": _store_extracts(rag_result.get("chunks", []))} if req.include_citations else {}
             
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": MODEL_RAG_NAME,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "citations": citations_payload,
+            "extra": extra_payload,
         }
 
-async def _stream_generator(messages, req, sources):
+async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_citations: bool):
     """Yields SSE events."""
     payload = {
         "model": UPSTREAM_MODEL_RAG,
@@ -944,6 +1083,7 @@ async def _stream_generator(messages, req, sources):
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     client, should_close = await _get_http_client()
+    streamed_text = ""
     try:
         async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -951,6 +1091,12 @@ async def _stream_generator(messages, req, sources):
                 if line.startswith("data: ") and line != "data: [DONE]":
                     try:
                         data = json.loads(line[6:])
+                        try:
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            if isinstance(delta, dict):
+                                streamed_text += str(delta.get("content", ""))
+                        except Exception:
+                            pass
                         # Clean up model name in response
                         data["model"] = MODEL_RAG_NAME
                         yield f"data: {json.dumps(data)}\n\n"
@@ -978,8 +1124,41 @@ async def _stream_generator(messages, req, sources):
         if should_close:
             await client.aclose()
     
-    # Append sources at the end
-    if sources:
+    # Append chunk trace and sources at the end
+    if include_chunks:
+        chunk_text = _format_chunks_trace(chunks)
+        if chunk_text:
+            chunk = {
+                "id": "chunks",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": MODEL_RAG_NAME,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n{chunk_text}"}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+    if include_citations:
+        extra_sources = _store_extracts(chunks)
+        extra_chunk = {
+            "id": "extra",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": MODEL_RAG_NAME,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": None, "extra": {"sources": extra_sources}}],
+            "extra": {"sources": extra_sources},
+        }
+        yield f"data: {json.dumps(extra_chunk)}\n\n"
+
+        refs_chunk = {
+            "id": "citations",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": MODEL_RAG_NAME,
+            "choices": [{"index": 0, "delta": {"citations": _build_citations(chunks)}, "finish_reason": None}]
+        }
+        yield f"data: {json.dumps(refs_chunk)}\n\n"
+
+    if req.include_sources and sources and not _contains_sources_block(streamed_text):
         src_text = f"\n\nSources: {', '.join(sources)}"
         chunk = {
             "id": "sources",
