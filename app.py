@@ -130,6 +130,7 @@ _last_ingestion_mtime: Optional[float] = None
 _embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
 _query_rewrite_cache: "OrderedDict[str, str]" = OrderedDict()
 _hyde_cache: "OrderedDict[str, str]" = OrderedDict()
+_extract_store: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
 
 class ExternalAPIEmbeddings(Embeddings):
@@ -572,6 +573,34 @@ def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _contains_sources_block(text: str) -> bool:
     return "Sources:" in text or "Source:" in text
 
+
+def _store_extracts(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        extract_id = hashlib.md5(
+            f"{chunk.get('source','')}|{chunk.get('page','')}|{chunk.get('excerpt','')}".encode("utf-8")
+        ).hexdigest()
+        _extract_store[extract_id] = {
+            "page_content": chunk.get("excerpt", ""),
+            "source": chunk.get("source", "unknown"),
+            "url": chunk.get("url", ""),
+            "page": chunk.get("page", ""),
+            "score": chunk.get("score", None),
+            "confidence": chunk.get("confidence", None),
+        }
+        if len(_extract_store) > CACHE_MAX_SIZE:
+            _extract_store.popitem(last=False)
+        sources.append(
+            {
+                "_id": extract_id,
+                "filename": chunk.get("source", "unknown"),
+                "page": chunk.get("page", ""),
+                "file_url": chunk.get("url", ""),
+                "relevance_score": chunk.get("confidence", chunk.get("score", 0.0)) or 0.0,
+            }
+        )
+    return sources
+
 def check_auth(authorization: str = Header(None)):
     if AUTH_TOKEN:
         if not authorization or authorization.split(" ", 1)[-1] != AUTH_TOKEN:
@@ -930,6 +959,14 @@ def health():
 def list_models():
     return {"data": [{"id": MODEL_RAG_NAME, "object": "model"}]}
 
+
+@app.get("/extract/{extract_id}")
+def get_extract(extract_id: str):
+    item = _extract_store.get(extract_id)
+    if not item:
+        raise HTTPException(404, "Extract not found")
+    return {"id": extract_id, **item}
+
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
 async def chat_endpoint(req: ChatReq):
     if req.model != MODEL_RAG_NAME:
@@ -1022,6 +1059,7 @@ async def chat_endpoint(req: ChatReq):
         if req.include_citations:
             citations_payload = _build_citations(rag_result.get("chunks", []))
             message["citations"] = citations_payload
+        extra_payload = {"sources": _store_extracts(rag_result.get("chunks", []))} if req.include_citations else {}
             
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
@@ -1030,6 +1068,7 @@ async def chat_endpoint(req: ChatReq):
             "model": MODEL_RAG_NAME,
             "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
             "citations": citations_payload,
+            "extra": extra_payload,
         }
 
 async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_citations: bool):
@@ -1099,6 +1138,17 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
             yield f"data: {json.dumps(chunk)}\n\n"
 
     if include_citations:
+        extra_sources = _store_extracts(chunks)
+        extra_chunk = {
+            "id": "extra",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": MODEL_RAG_NAME,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": None, "extra": {"sources": extra_sources}}],
+            "extra": {"sources": extra_sources},
+        }
+        yield f"data: {json.dumps(extra_chunk)}\n\n"
+
         refs_chunk = {
             "id": "citations",
             "object": "chat.completion.chunk",
