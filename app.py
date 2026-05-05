@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "changeme")
 OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
+UPSTREAM_TIMEOUT_SECONDS = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "60"))
 
 AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "changeme")
 
@@ -171,7 +172,10 @@ async def lifespan(app: FastAPI):
     _index_lock = asyncio.Lock()
     
     # 2. HTTP Client for upstream LLM calls
-    _http_client = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=20))
+    _http_client = httpx.AsyncClient(
+        timeout=UPSTREAM_TIMEOUT_SECONDS,
+        limits=httpx.Limits(max_keepalive_connections=20),
+    )
     
     # 3. Load Models
     _get_embeddings()
@@ -536,7 +540,10 @@ def _cache_set(cache: "OrderedDict[str, Any]", key: str, value: Any) -> None:
 async def _get_http_client() -> Tuple[httpx.AsyncClient, bool]:
     if _http_client is not None:
         return _http_client, False
-    return httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=20)), True
+    return httpx.AsyncClient(
+        timeout=UPSTREAM_TIMEOUT_SECONDS,
+        limits=httpx.Limits(max_keepalive_connections=20),
+    ), True
 
 async def _call_upstream_llm(
     messages: List[Dict[str, str]], 
@@ -901,7 +908,14 @@ async def chat_endpoint(req: ChatReq):
         client, should_close = await _get_http_client()
         try:
             resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
+            resp.raise_for_status()
             data = resp.json()
+        except httpx.TimeoutException:
+            logger.error("Upstream chat request timed out.")
+            raise HTTPException(status_code=504, detail="Upstream model timeout")
+        except httpx.HTTPError as e:
+            logger.error(f"Upstream chat request failed: {e}")
+            raise HTTPException(status_code=502, detail="Upstream model request failed")
         finally:
             if should_close:
                 await client.aclose()
@@ -932,6 +946,7 @@ async def _stream_generator(messages, req, sources):
     client, should_close = await _get_http_client()
     try:
         async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers) as resp:
+            resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line.startswith("data: ") and line != "data: [DONE]":
                     try:
@@ -941,6 +956,24 @@ async def _stream_generator(messages, req, sources):
                         yield f"data: {json.dumps(data)}\n\n"
                     except Exception:
                         pass
+    except httpx.TimeoutException:
+        logger.error("Upstream streaming request timed out.")
+        err = {
+            "error": {
+                "message": "Upstream model timeout",
+                "type": "timeout_error",
+            }
+        }
+        yield f"data: {json.dumps(err)}\n\n"
+    except httpx.HTTPError as e:
+        logger.error(f"Upstream streaming request failed: {e}")
+        err = {
+            "error": {
+                "message": "Upstream model request failed",
+                "type": "upstream_error",
+            }
+        }
+        yield f"data: {json.dumps(err)}\n\n"
     finally:
         if should_close:
             await client.aclose()
