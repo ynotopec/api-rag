@@ -555,6 +555,10 @@ def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
     return refs
 
+
+def _contains_sources_block(text: str) -> bool:
+    return "Sources:" in text
+
 def check_auth(authorization: str = Header(None)):
     if AUTH_TOKEN:
         if not authorization or authorization.split(" ", 1)[-1] != AUTH_TOKEN:
@@ -990,7 +994,7 @@ async def chat_endpoint(req: ChatReq):
             chunk_text = _format_chunks_trace(rag_result.get("chunks", []))
             if chunk_text:
                 content += f"\n\n{chunk_text}"
-        if rag_result["sources"]:
+        if rag_result["sources"] and not _contains_sources_block(content):
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
 
         message: Dict[str, Any] = {"role": "assistant", "content": content}
