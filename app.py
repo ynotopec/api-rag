@@ -542,10 +542,15 @@ def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for chunk in chunks:
         source_name = chunk.get("source", "unknown")
         source_url = chunk.get("url", "")
+        page = chunk.get("page", "")
         excerpt = chunk.get("excerpt", "")
+        confidence = chunk.get("confidence", None)
+        score = chunk.get("score", None)
         source_obj = {"name": source_name}
         if source_url:
             source_obj["url"] = source_url
+        if page != "":
+            source_obj["page"] = page
         refs.append(
             {
                 "document": [excerpt],
@@ -553,6 +558,9 @@ def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     {
                         "source": source_name,
                         "rank": chunk.get("rank", "?"),
+                        "score": score,
+                        "confidence": confidence,
+                        "page": page,
                     }
                 ],
                 "source": source_obj,
@@ -794,12 +802,15 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
     async def search_original():
         res = []
         if _vector:
-            res.extend(await asyncio.get_event_loop().run_in_executor(
+            scored = await asyncio.get_event_loop().run_in_executor(
                 _executor, 
                 lambda: _vector.similarity_search_with_score(user_query, k=MMR_K)
-            ))
-            # Unwrap tuple (doc, score) -> doc
-            res = [r[0] for r in res]
+            )
+            for doc, score in scored:
+                doc.metadata["_retrieval_score"] = float(score)
+                # FAISS distance -> confidence-like score in [0,1]
+                doc.metadata["_retrieval_confidence"] = 1.0 / (1.0 + max(float(score), 0.0))
+                res.append(doc)
         if ENABLE_HYBRID_SEARCH and _bm25_retriever:
              res.extend(await asyncio.get_event_loop().run_in_executor(
                 _executor, _bm25_retriever.invoke, user_query
@@ -888,6 +899,9 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
                 "rank": i + 1,
                 "source": doc.metadata.get("source", "unknown"),
                 "url": doc.metadata.get("url") or doc.metadata.get("link") or "",
+                "page": doc.metadata.get("page", ""),
+                "score": doc.metadata.get("_retrieval_score", None),
+                "confidence": doc.metadata.get("_retrieval_confidence", None),
                 "excerpt": clean_content,
             }
         )
