@@ -998,15 +998,18 @@ async def chat_endpoint(req: ChatReq):
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
 
         message: Dict[str, Any] = {"role": "assistant", "content": content}
+        citations_payload: List[Dict[str, Any]] = []
         if req.include_citations:
-            message["citations"] = _build_citations(rag_result.get("chunks", []))
+            citations_payload = _build_citations(rag_result.get("chunks", []))
+            message["citations"] = citations_payload
             
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": MODEL_RAG_NAME,
-            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "citations": citations_payload,
         }
 
 async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_citations: bool):
@@ -1021,6 +1024,7 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     client, should_close = await _get_http_client()
+    streamed_text = ""
     try:
         async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -1028,6 +1032,12 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
                 if line.startswith("data: ") and line != "data: [DONE]":
                     try:
                         data = json.loads(line[6:])
+                        try:
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            if isinstance(delta, dict):
+                                streamed_text += str(delta.get("content", ""))
+                        except Exception:
+                            pass
                         # Clean up model name in response
                         data["model"] = MODEL_RAG_NAME
                         yield f"data: {json.dumps(data)}\n\n"
@@ -1078,7 +1088,7 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
         }
         yield f"data: {json.dumps(refs_chunk)}\n\n"
 
-    if sources:
+    if sources and not _contains_sources_block(streamed_text):
         src_text = f"\n\nSources: {', '.join(sources)}"
         chunk = {
             "id": "sources",
