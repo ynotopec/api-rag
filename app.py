@@ -504,7 +504,7 @@ class ChatReq(BaseModel):
     temperature: Optional[float] = 0.2
     stream: Optional[bool] = False
     include_chunks: Optional[bool] = False
-    include_references: Optional[bool] = True
+    include_citations: Optional[bool] = True
     max_tokens: Optional[int] = None
     top_p: Optional[float] = 1.0
 
@@ -536,16 +536,21 @@ def _format_chunks_trace(chunks: List[Dict[str, Any]]) -> str:
     return result
 
 
-def _build_references(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     refs = []
     for chunk in chunks:
+        source_name = chunk.get("source", "unknown")
+        excerpt = chunk.get("excerpt", "")
         refs.append(
             {
-                "id": f"chunk-{chunk.get('rank', '?')}",
-                "type": "chunk",
-                "source": chunk.get("source", "unknown"),
-                "excerpt": chunk.get("excerpt", ""),
-                "metadata": {"rank": chunk.get("rank", "?")},
+                "document": [excerpt],
+                "metadata": [
+                    {
+                        "source": source_name,
+                        "rank": chunk.get("rank", "?"),
+                    }
+                ],
+                "source": {"name": source_name},
             }
         )
     return refs
@@ -949,7 +954,7 @@ async def chat_endpoint(req: ChatReq):
                 rag_result["sources"],
                 rag_result.get("chunks", []),
                 bool(req.include_chunks),
-                bool(req.include_references),
+                bool(req.include_citations),
             ),
             media_type="text/event-stream"
         )
@@ -989,8 +994,8 @@ async def chat_endpoint(req: ChatReq):
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
 
         message: Dict[str, Any] = {"role": "assistant", "content": content}
-        if req.include_references:
-            message["references"] = _build_references(rag_result.get("chunks", []))
+        if req.include_citations:
+            message["citations"] = _build_citations(rag_result.get("chunks", []))
             
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
@@ -1000,7 +1005,7 @@ async def chat_endpoint(req: ChatReq):
             "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
         }
 
-async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_references: bool):
+async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_citations: bool):
     """Yields SSE events."""
     payload = {
         "model": UPSTREAM_MODEL_RAG,
@@ -1059,13 +1064,13 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
-    if include_references:
+    if include_citations:
         refs_chunk = {
-            "id": "references",
+            "id": "citations",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": MODEL_RAG_NAME,
-            "choices": [{"index": 0, "delta": {"references": _build_references(chunks)}, "finish_reason": None}]
+            "choices": [{"index": 0, "delta": {"citations": _build_citations(chunks)}, "finish_reason": None}]
         }
         yield f"data: {json.dumps(refs_chunk)}\n\n"
 
