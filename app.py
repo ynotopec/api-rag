@@ -540,7 +540,11 @@ def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     refs = []
     for chunk in chunks:
         source_name = chunk.get("source", "unknown")
+        source_url = chunk.get("url", "")
         excerpt = chunk.get("excerpt", "")
+        source_obj = {"name": source_name}
+        if source_url:
+            source_obj["url"] = source_url
         refs.append(
             {
                 "document": [excerpt],
@@ -550,14 +554,14 @@ def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         "rank": chunk.get("rank", "?"),
                     }
                 ],
-                "source": {"name": source_name},
+                "source": source_obj,
             }
         )
     return refs
 
 
 def _contains_sources_block(text: str) -> bool:
-    return "Sources:" in text
+    return "Sources:" in text or "Source:" in text
 
 def check_auth(authorization: str = Header(None)):
     if AUTH_TOKEN:
@@ -882,6 +886,7 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
             {
                 "rank": i + 1,
                 "source": doc.metadata.get("source", "unknown"),
+                "url": doc.metadata.get("url") or doc.metadata.get("link") or "",
                 "excerpt": clean_content,
             }
         )
