@@ -503,21 +503,52 @@ class ChatReq(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
     stream: Optional[bool] = False
-    include_chunks: Optional[bool] = True
+    include_chunks: Optional[bool] = False
+    include_references: Optional[bool] = True
     max_tokens: Optional[int] = None
     top_p: Optional[float] = 1.0
+
+
+_chunks_trace_cache: "OrderedDict[str, str]" = OrderedDict()
 
 
 def _format_chunks_trace(chunks: List[Dict[str, Any]]) -> str:
     if not chunks:
         return ""
-    lines = ["Chunks utilisés:"]
+
+    cache_key = _get_cache_key(json.dumps(chunks, sort_keys=True, ensure_ascii=False))
+    cached = _cache_get(_chunks_trace_cache, cache_key)
+    if cached is not None:
+        return cached
+
+    lines = ["### Chunks utilisés"]
     for chunk in chunks:
         idx = chunk.get("rank", "?")
         source = chunk.get("source", "unknown")
-        excerpt = chunk.get("excerpt", "")
-        lines.append(f"- [{idx}] ({source}) {excerpt}")
-    return "\n".join(lines)
+        excerpt = str(chunk.get("excerpt", "")).replace("\n", " ").strip()
+        if len(excerpt) > 320:
+            excerpt = excerpt[:317].rstrip() + "..."
+        lines.append(f"- **[{idx}]** `{source}`  ")
+        lines.append(f"  > {excerpt}")
+
+    result = "\n".join(lines)
+    _cache_set(_chunks_trace_cache, cache_key, result)
+    return result
+
+
+def _build_references(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    refs = []
+    for chunk in chunks:
+        refs.append(
+            {
+                "id": f"chunk-{chunk.get('rank', '?')}",
+                "type": "chunk",
+                "source": chunk.get("source", "unknown"),
+                "excerpt": chunk.get("excerpt", ""),
+                "metadata": {"rank": chunk.get("rank", "?")},
+            }
+        )
+    return refs
 
 def check_auth(authorization: str = Header(None)):
     if AUTH_TOKEN:
@@ -912,7 +943,14 @@ async def chat_endpoint(req: ChatReq):
     # 3. Stream or Return
     if req.stream:
         return StreamingResponse(
-            _stream_generator(final_messages, req, rag_result["sources"], rag_result.get("chunks", []), bool(req.include_chunks)),
+            _stream_generator(
+                final_messages,
+                req,
+                rag_result["sources"],
+                rag_result.get("chunks", []),
+                bool(req.include_chunks),
+                bool(req.include_references),
+            ),
             media_type="text/event-stream"
         )
     else:
@@ -949,16 +987,20 @@ async def chat_endpoint(req: ChatReq):
                 content += f"\n\n{chunk_text}"
         if rag_result["sources"]:
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
+
+        message: Dict[str, Any] = {"role": "assistant", "content": content}
+        if req.include_references:
+            message["references"] = _build_references(rag_result.get("chunks", []))
             
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": MODEL_RAG_NAME,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
         }
 
-async def _stream_generator(messages, req, sources, chunks, include_chunks: bool):
+async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_references: bool):
     """Yields SSE events."""
     payload = {
         "model": UPSTREAM_MODEL_RAG,
@@ -1016,6 +1058,16 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
                 "choices": [{"index": 0, "delta": {"content": f"\n\n{chunk_text}"}, "finish_reason": None}]
             }
             yield f"data: {json.dumps(chunk)}\n\n"
+
+    if include_references:
+        refs_chunk = {
+            "id": "references",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": MODEL_RAG_NAME,
+            "choices": [{"index": 0, "delta": {"references": _build_references(chunks)}, "finish_reason": None}]
+        }
+        yield f"data: {json.dumps(refs_chunk)}\n\n"
 
     if sources:
         src_text = f"\n\nSources: {', '.join(sources)}"
