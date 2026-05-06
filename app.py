@@ -541,6 +541,32 @@ def _format_chunks_trace(chunks: List[Dict[str, Any]]) -> str:
     return result
 
 
+def _format_citations_trace(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return ""
+
+    lines = ["### Citations"]
+    for chunk in chunks:
+        idx = chunk.get("rank", "?")
+        source = chunk.get("source", "unknown")
+        page = chunk.get("page", "")
+        url = chunk.get("url", "")
+        excerpt = str(chunk.get("excerpt", "")).replace("\n", " ").strip()
+        if len(excerpt) > 220:
+            excerpt = excerpt[:217].rstrip() + "..."
+
+        details = source
+        if page != "":
+            details += f", page {page}"
+        if url:
+            details += f" — {url}"
+        lines.append(f"- [{idx}] {details}")
+        if excerpt:
+            lines.append(f"  > {excerpt}")
+
+    return "\n".join(lines)
+
+
 def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     refs = []
     for chunk in chunks:
@@ -575,6 +601,10 @@ def _build_citations(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _contains_sources_block(text: str) -> bool:
     return "Sources:" in text or "Source:" in text
+
+
+def _contains_citations_block(text: str) -> bool:
+    return "### Citations" in text or "Citations:" in text
 
 
 def _store_extracts(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1058,6 +1088,10 @@ async def chat_endpoint(req: ChatReq):
             chunk_text = _format_chunks_trace(rag_result.get("chunks", []))
             if chunk_text:
                 content += f"\n\n{chunk_text}"
+        if include_citations and not _contains_citations_block(content):
+            citations_text = _format_citations_trace(rag_result.get("chunks", []))
+            if citations_text:
+                content += f"\n\n{citations_text}"
         if include_sources and rag_result["sources"] and not _contains_sources_block(content):
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
 
@@ -1145,6 +1179,18 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
             yield f"data: {json.dumps(chunk)}\n\n"
 
     if include_citations:
+        citations_text = _format_citations_trace(chunks)
+        if citations_text and not _contains_citations_block(streamed_text):
+            chunk = {
+                "id": "citations-content",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": MODEL_RAG_NAME,
+                "choices": [{"index": 0, "delta": {"content": f"\n\n{citations_text}"}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            streamed_text += f"\n\n{citations_text}"
+
         extra_sources = _store_extracts(chunks)
         extra_chunk = {
             "id": "extra",
