@@ -545,7 +545,7 @@ def _format_citations_trace(chunks: List[Dict[str, Any]]) -> str:
     if not chunks:
         return ""
 
-    lines = ["### Citations"]
+    lines = ["Citations:"]
     for chunk in chunks:
         idx = chunk.get("rank", "?")
         source = chunk.get("source", "unknown")
@@ -560,9 +560,9 @@ def _format_citations_trace(chunks: List[Dict[str, Any]]) -> str:
             details += f", page {page}"
         if url:
             details += f" — {url}"
-        lines.append(f"- [{idx}] {details}")
+        lines.append(f"[{idx}] {details}")
         if excerpt:
-            lines.append(f"  > {excerpt}")
+            lines.append(f"    Extrait: {excerpt}")
 
     return "\n".join(lines)
 
@@ -604,7 +604,7 @@ def _contains_sources_block(text: str) -> bool:
 
 
 def _contains_citations_block(text: str) -> bool:
-    return "### Citations" in text or "Citations:" in text
+    return "Citations:" in text
 
 
 def _store_extracts(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
