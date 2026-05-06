@@ -88,6 +88,9 @@ ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "false").lower() == "tr
 ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "false").lower() == "true"
 ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "true").lower() == "true"
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
+DEFAULT_INCLUDE_CHUNKS = os.getenv("DEFAULT_INCLUDE_CHUNKS", "true").lower() in {"1", "true", "yes", "on"}
+DEFAULT_INCLUDE_CITATIONS = os.getenv("DEFAULT_INCLUDE_CITATIONS", "true").lower() in {"1", "true", "yes", "on"}
+DEFAULT_INCLUDE_SOURCES = os.getenv("DEFAULT_INCLUDE_SOURCES", "true").lower() in {"1", "true", "yes", "on"}
 
 # Chunking
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
@@ -504,9 +507,9 @@ class ChatReq(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
     stream: Optional[bool] = False
-    include_chunks: Optional[bool] = False
-    include_citations: Optional[bool] = False
-    include_sources: Optional[bool] = False
+    include_chunks: Optional[bool] = None
+    include_citations: Optional[bool] = None
+    include_sources: Optional[bool] = None
     max_tokens: Optional[int] = None
     top_p: Optional[float] = 1.0
 
@@ -1014,8 +1017,8 @@ async def chat_endpoint(req: ChatReq):
                 req,
                 rag_result["sources"],
                 rag_result.get("chunks", []),
-                bool(req.include_chunks),
-                bool(req.include_citations),
+                req.include_chunks if req.include_chunks is not None else DEFAULT_INCLUDE_CHUNKS,
+                req.include_citations if req.include_citations is not None else DEFAULT_INCLUDE_CITATIONS,
             ),
             media_type="text/event-stream"
         )
@@ -1047,19 +1050,23 @@ async def chat_endpoint(req: ChatReq):
                 await client.aclose()
             
         content = data["choices"][0]["message"]["content"]
-        if req.include_chunks:
+        include_chunks = req.include_chunks if req.include_chunks is not None else DEFAULT_INCLUDE_CHUNKS
+        include_sources = req.include_sources if req.include_sources is not None else DEFAULT_INCLUDE_SOURCES
+        include_citations = req.include_citations if req.include_citations is not None else DEFAULT_INCLUDE_CITATIONS
+
+        if include_chunks:
             chunk_text = _format_chunks_trace(rag_result.get("chunks", []))
             if chunk_text:
                 content += f"\n\n{chunk_text}"
-        if req.include_sources and rag_result["sources"] and not _contains_sources_block(content):
+        if include_sources and rag_result["sources"] and not _contains_sources_block(content):
             content += f"\n\nSources: {', '.join(rag_result['sources'])}"
 
         message: Dict[str, Any] = {"role": "assistant", "content": content}
         citations_payload: List[Dict[str, Any]] = []
-        if req.include_citations:
+        if include_citations:
             citations_payload = _build_citations(rag_result.get("chunks", []))
             message["citations"] = citations_payload
-        extra_payload = {"sources": _store_extracts(rag_result.get("chunks", []))} if req.include_citations else {}
+        extra_payload = {"sources": _store_extracts(rag_result.get("chunks", []))} if include_citations else {}
             
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
@@ -1158,7 +1165,8 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
         }
         yield f"data: {json.dumps(refs_chunk)}\n\n"
 
-    if req.include_sources and sources and not _contains_sources_block(streamed_text):
+    include_sources = req.include_sources if req.include_sources is not None else DEFAULT_INCLUDE_SOURCES
+    if include_sources and sources and not _contains_sources_block(streamed_text):
         src_text = f"\n\nSources: {', '.join(sources)}"
         chunk = {
             "id": "sources",
