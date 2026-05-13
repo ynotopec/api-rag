@@ -8,6 +8,7 @@ import pickle
 import logging
 import mailbox
 import email
+from urllib.parse import urlparse
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -56,8 +57,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
+CHAT_API_BASE = os.getenv("CHAT_API_BASE", os.getenv("OPENAI_CHAT_API_BASE", OPENAI_API_BASE)).rstrip("/")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "changeme")
-OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
+OPENAI_CHAT_COMPLETIONS_URL = CHAT_API_BASE + "/chat/completions"
 UPSTREAM_TIMEOUT_SECONDS = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "60"))
 UPSTREAM_PRESENCE_PENALTY = float(os.getenv("UPSTREAM_PRESENCE_PENALTY", "0.0"))
 UPSTREAM_FREQUENCY_PENALTY = float(os.getenv("UPSTREAM_FREQUENCY_PENALTY", "0.3"))
@@ -677,6 +679,11 @@ def _should_retry_without_penalties(exc: httpx.HTTPStatusError, payload: Dict[st
     )
 
 
+def _chat_upstream_host() -> str:
+    parsed = urlparse(OPENAI_CHAT_COMPLETIONS_URL)
+    return parsed.netloc or OPENAI_CHAT_COMPLETIONS_URL
+
+
 def _summarize_upstream_error(exc: httpx.HTTPError) -> str:
     """Create a concise, useful upstream error for logs and API responses."""
     if isinstance(exc, httpx.HTTPStatusError):
@@ -685,7 +692,19 @@ def _summarize_upstream_error(exc: httpx.HTTPError) -> str:
         if len(text) > 500:
             text = text[:500] + "..."
         return f"Upstream model request failed with HTTP {status}: {text or exc.response.reason_phrase}"
+    if isinstance(exc, httpx.ConnectError):
+        return (
+            f"Unable to connect to upstream chat host '{_chat_upstream_host()}'. "
+            "Check CHAT_API_BASE/OPENAI_CHAT_API_BASE or OPENAI_API_BASE DNS and network settings. "
+            f"Original error: {exc}"
+        )
     return f"Upstream model request failed: {exc}"
+
+
+def _upstream_error_status(exc: httpx.HTTPError) -> int:
+    if isinstance(exc, httpx.ConnectError):
+        return 503
+    return 502
 
 
 async def _post_upstream_chat_json(
@@ -717,28 +736,31 @@ async def _get_http_client() -> Tuple[httpx.AsyncClient, bool]:
     ), True
 
 async def _call_upstream_llm(
-    messages: List[Dict[str, str]], 
-    model: str, 
+    messages: List[Dict[str, str]],
+    model: str,
     max_tokens: int = 1000,
     temp: float = 0.1
 ) -> str:
     """Helper to call OpenAI compatible endpoint."""
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temp,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
+    payload = _build_chat_payload(
+        messages,
+        model=model,
+        temperature=temp,
+        stream=False,
+        max_tokens=max_tokens,
+        include_penalties=False,
+    )
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    
+
     client, should_close = await _get_http_client()
     try:
-        resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        data = await _post_upstream_chat_json(client, payload, headers)
+        return data["choices"][0]["message"]["content"]
+    except httpx.HTTPError as e:
+        logger.error(f"LLM Call failed: {_summarize_upstream_error(e)}")
+        return ""
     except Exception as e:
-        logger.error(f"LLM Call failed: {e}")
+        logger.error(f"LLM Call failed while parsing upstream response: {e}")
         return ""
     finally:
         if should_close:
@@ -1116,7 +1138,7 @@ async def chat_endpoint(req: ChatReq):
         except httpx.HTTPError as e:
             detail = _summarize_upstream_error(e)
             logger.error(detail)
-            raise HTTPException(status_code=502, detail=detail)
+            raise HTTPException(status_code=_upstream_error_status(e), detail=detail)
         finally:
             if should_close:
                 await client.aclose()

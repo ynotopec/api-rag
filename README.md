@@ -163,7 +163,8 @@ sequenceDiagram
 
 | Variable | Défaut | Description |
 | --- | --- | --- |
-| `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible en amont. |
+| `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible par défaut pour les appels chat, embeddings et reranking. |
+| `CHAT_API_BASE` / `OPENAI_CHAT_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée au chat (optionnelle), suffixée automatiquement par `/chat/completions`; utile si embeddings et chat sont servis par des hôtes différents. |
 | `EMBEDDINGS_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée embeddings (optionnelle), suffixée automatiquement par `/embeddings`. |
 | `OPENAI_API_KEY` | `changeme` | Clé API pour l’amont. |
 | `API_AUTH_TOKEN` | *(vide)* | Si défini : **obligatoire** en entrée via `Authorization: Bearer …`. |
@@ -272,6 +273,7 @@ pip install -r requirements.txt
 
 ```bash
 export OPENAI_API_BASE="https://api.openai.com/v1"           # ou votre passerelle vLLM
+# export CHAT_API_BASE="https://chat-gateway.example.com/v1"    # optionnel si le chat est sur un autre hôte
 export OPENAI_API_KEY="sk-..."
 export API_AUTH_TOKEN="my-inbound-token"
 uvicorn app:app --host 0.0.0.0 --port 8080
@@ -284,6 +286,7 @@ Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uv
 ```bash
 # Exemple minimal .env
 OPENAI_API_BASE="https://api.openai.com/v1"
+# CHAT_API_BASE="https://chat-gateway.example.com/v1"  # optionnel si différent de OPENAI_API_BASE
 OPENAI_API_KEY="sk-..."
 API_AUTH_TOKEN="my-inbound-token"
 ```
