@@ -169,6 +169,8 @@ sequenceDiagram
 | `API_AUTH_TOKEN` | *(vide)* | Si défini : **obligatoire** en entrée via `Authorization: Bearer …`. |
 | `UPSTREAM_MODEL_RAG` | `gpt-4o-mini` | Modèle amont pour la génération RAG. |
 | `UPSTREAM_MODEL_REWRITE` | `=UPSTREAM_MODEL_RAG` | Modèle amont pour la réécriture et HyDE. |
+| `UPSTREAM_PRESENCE_PENALTY` | `0.0` | Pénalité de présence envoyée au chat amont; retirée automatiquement au retry si l’amont la rejette. |
+| `UPSTREAM_FREQUENCY_PENALTY` | `0.3` | Pénalité de fréquence envoyée au chat amont; retirée automatiquement au retry si l’amont la rejette. |
 | `MODEL_RAG` | `ai-rag` | Nom logique exposé pour le pipeline RAG. |
 | `VECTORSTORE_DIR` | `vectorstore_db` | Dossier du FAISS sérialisé (persisté sur disque). |
 | `WIKI_TXT` | `wiki.txt` | Corpus brut utilisé pour construire le FAISS si absent. |

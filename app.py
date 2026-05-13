@@ -59,6 +59,8 @@ OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "changeme")
 OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 UPSTREAM_TIMEOUT_SECONDS = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "60"))
+UPSTREAM_PRESENCE_PENALTY = float(os.getenv("UPSTREAM_PRESENCE_PENALTY", "0.0"))
+UPSTREAM_FREQUENCY_PENALTY = float(os.getenv("UPSTREAM_FREQUENCY_PENALTY", "0.3"))
 
 AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "changeme")
 
@@ -632,6 +634,80 @@ def _cache_set(cache: "OrderedDict[str, Any]", key: str, value: Any) -> None:
         cache.popitem(last=False)
 
 
+def _build_chat_payload(
+    messages: List[Dict[str, str]],
+    *,
+    model: str,
+    temperature: Optional[float],
+    stream: bool,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    include_penalties: bool = True,
+) -> Dict[str, Any]:
+    """Build an OpenAI-compatible chat payload, omitting unset optional fields."""
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if include_penalties:
+        payload["presence_penalty"] = UPSTREAM_PRESENCE_PENALTY
+        payload["frequency_penalty"] = UPSTREAM_FREQUENCY_PENALTY
+    return payload
+
+
+def _payload_without_penalties(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy for upstream servers that reject penalty parameters."""
+    stripped = dict(payload)
+    stripped.pop("presence_penalty", None)
+    stripped.pop("frequency_penalty", None)
+    return stripped
+
+
+def _should_retry_without_penalties(exc: httpx.HTTPStatusError, payload: Dict[str, Any]) -> bool:
+    return (
+        exc.response.status_code in {400, 422}
+        and ("presence_penalty" in payload or "frequency_penalty" in payload)
+    )
+
+
+def _summarize_upstream_error(exc: httpx.HTTPError) -> str:
+    """Create a concise, useful upstream error for logs and API responses."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        text = exc.response.text.strip()
+        if len(text) > 500:
+            text = text[:500] + "..."
+        return f"Upstream model request failed with HTTP {status}: {text or exc.response.reason_phrase}"
+    return f"Upstream model request failed: {exc}"
+
+
+async def _post_upstream_chat_json(
+    client: httpx.AsyncClient,
+    payload: Dict[str, Any],
+    headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Post a non-streaming chat request, retrying for compatibility if needed."""
+    try:
+        resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as exc:
+        if _should_retry_without_penalties(exc, payload):
+            logger.warning("Upstream rejected penalty parameters; retrying chat request without them.")
+            retry_payload = _payload_without_penalties(payload)
+            resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=retry_payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        raise
+
+
 async def _get_http_client() -> Tuple[httpx.AsyncClient, bool]:
     if _http_client is not None:
         return _http_client, False
@@ -1021,27 +1097,26 @@ async def chat_endpoint(req: ChatReq):
         )
     else:
         # Sync Call
-        payload = {
-            "model": UPSTREAM_MODEL_RAG,
-            "messages": final_messages,
-            "temperature": req.temperature,
-            "presence_penalty": 0.0,   # Nouveau
-            "frequency_penalty": 0.3,  # <--- AJOUTER CECI (0.3 à 0.5)
-            "stream": False
-        }
+        payload = _build_chat_payload(
+            final_messages,
+            model=UPSTREAM_MODEL_RAG,
+            temperature=req.temperature,
+            stream=False,
+            max_tokens=req.max_tokens,
+            top_p=req.top_p,
+        )
 
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
         client, should_close = await _get_http_client()
         try:
-            resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+            data = await _post_upstream_chat_json(client, payload, headers)
         except httpx.TimeoutException:
             logger.error("Upstream chat request timed out.")
             raise HTTPException(status_code=504, detail="Upstream model timeout")
         except httpx.HTTPError as e:
-            logger.error(f"Upstream chat request failed: {e}")
-            raise HTTPException(status_code=502, detail="Upstream model request failed")
+            detail = _summarize_upstream_error(e)
+            logger.error(detail)
+            raise HTTPException(status_code=502, detail=detail)
         finally:
             if should_close:
                 await client.aclose()
@@ -1073,19 +1148,20 @@ async def chat_endpoint(req: ChatReq):
 
 async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_citations: bool):
     """Yields SSE events."""
-    payload = {
-        "model": UPSTREAM_MODEL_RAG,
-        "messages": messages,
-        "temperature": req.temperature,
-        "presence_penalty": 0.0,   # Nouveau
-        "frequency_penalty": 0.3,  # <--- AJOUTER CECI
-        "stream": True
-    }
+    payload = _build_chat_payload(
+        messages,
+        model=UPSTREAM_MODEL_RAG,
+        temperature=req.temperature,
+        stream=True,
+        max_tokens=req.max_tokens,
+        top_p=req.top_p,
+    )
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     client, should_close = await _get_http_client()
     streamed_text = ""
-    try:
-        async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers) as resp:
+    async def emit_stream(stream_payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
+        nonlocal streamed_text
+        async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=stream_payload, headers=headers) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line.startswith("data: ") and line != "data: [DONE]":
@@ -1102,6 +1178,17 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
                         yield f"data: {json.dumps(data)}\n\n"
                     except Exception:
                         pass
+
+    try:
+        try:
+            async for event in emit_stream(payload):
+                yield event
+        except httpx.HTTPStatusError as exc:
+            if not _should_retry_without_penalties(exc, payload):
+                raise
+            logger.warning("Upstream rejected penalty parameters; retrying streaming chat request without them.")
+            async for event in emit_stream(_payload_without_penalties(payload)):
+                yield event
     except httpx.TimeoutException:
         logger.error("Upstream streaming request timed out.")
         err = {
@@ -1112,10 +1199,11 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
         }
         yield f"data: {json.dumps(err)}\n\n"
     except httpx.HTTPError as e:
-        logger.error(f"Upstream streaming request failed: {e}")
+        detail = _summarize_upstream_error(e)
+        logger.error(detail)
         err = {
             "error": {
-                "message": "Upstream model request failed",
+                "message": detail,
                 "type": "upstream_error",
             }
         }
