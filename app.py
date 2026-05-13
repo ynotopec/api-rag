@@ -1180,8 +1180,15 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     client, should_close = await _get_http_client()
     streamed_text = ""
+    emitted_upstream_event = False
+    upstream_failed = False
+
+    def sse_error(message: str, error_type: str) -> str:
+        err = {"error": {"message": message, "type": error_type}}
+        return f"data: {json.dumps(err)}\n\n"
+
     async def emit_stream(stream_payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
-        nonlocal streamed_text
+        nonlocal streamed_text, emitted_upstream_event
         async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=stream_payload, headers=headers) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
@@ -1196,43 +1203,88 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
                             pass
                         # Clean up model name in response
                         data["model"] = MODEL_RAG_NAME
+                        emitted_upstream_event = True
                         yield f"data: {json.dumps(data)}\n\n"
                     except Exception:
                         pass
+
+    async def emit_non_stream_fallback() -> AsyncGenerator[str, None]:
+        nonlocal streamed_text, emitted_upstream_event
+        fallback_payload = dict(payload)
+        fallback_payload["stream"] = False
+        data = await _post_upstream_chat_json(client, fallback_payload, headers)
+        content = data["choices"][0]["message"].get("content", "")
+        streamed_text += content
+        emitted_upstream_event = True
+        chunk = {
+            "id": data.get("id", f"chatcmpl-{uuid.uuid4()}"),
+            "object": "chat.completion.chunk",
+            "created": data.get("created", int(time.time())),
+            "model": MODEL_RAG_NAME,
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
 
     try:
         try:
             async for event in emit_stream(payload):
                 yield event
         except httpx.HTTPStatusError as exc:
-            if not _should_retry_without_penalties(exc, payload):
+            if emitted_upstream_event or not _should_retry_without_penalties(exc, payload):
                 raise
             logger.warning("Upstream rejected penalty parameters; retrying streaming chat request without them.")
             async for event in emit_stream(_payload_without_penalties(payload)):
                 yield event
     except httpx.TimeoutException:
+        upstream_failed = True
         logger.error("Upstream streaming request timed out.")
-        err = {
-            "error": {
-                "message": "Upstream model timeout",
-                "type": "timeout_error",
-            }
-        }
-        yield f"data: {json.dumps(err)}\n\n"
+        yield sse_error("Upstream model timeout", "timeout_error")
     except httpx.HTTPError as e:
-        detail = _summarize_upstream_error(e)
-        logger.error(detail)
-        err = {
-            "error": {
-                "message": detail,
-                "type": "upstream_error",
-            }
-        }
-        yield f"data: {json.dumps(err)}\n\n"
+        if not emitted_upstream_event:
+            try:
+                logger.warning("Upstream streaming request failed before any chunks; retrying once without streaming.")
+                async for event in emit_non_stream_fallback():
+                    yield event
+            except Exception as fallback_exc:
+                upstream_failed = True
+                if isinstance(fallback_exc, httpx.HTTPError):
+                    detail = _summarize_upstream_error(fallback_exc)
+                else:
+                    detail = f"Upstream model request failed: {fallback_exc}"
+                logger.error(detail)
+                yield sse_error(detail, "upstream_error")
+        else:
+            upstream_failed = True
+            detail = _summarize_upstream_error(e)
+            logger.error(detail)
+            yield sse_error(detail, "upstream_error")
+    except Exception as e:
+        if not emitted_upstream_event:
+            try:
+                logger.warning("Upstream stream ended before any chunks; retrying once without streaming.")
+                async for event in emit_non_stream_fallback():
+                    yield event
+            except Exception as fallback_exc:
+                upstream_failed = True
+                detail = (
+                    f"Upstream streaming response ended unexpectedly: {e}; "
+                    f"fallback failed: {fallback_exc}"
+                )
+                logger.error(detail)
+                yield sse_error(detail, "upstream_stream_error")
+        else:
+            upstream_failed = True
+            detail = f"Upstream streaming response ended unexpectedly: {e}"
+            logger.error(detail)
+            yield sse_error(detail, "upstream_stream_error")
     finally:
         if should_close:
             await client.aclose()
-    
+
+    if upstream_failed:
+        yield "data: [DONE]\n\n"
+        return
+
     # Append chunk trace and sources at the end
     if include_chunks:
         chunk_text = _format_chunks_trace(chunks)
