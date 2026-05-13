@@ -277,7 +277,7 @@ uvicorn app:app --host 0.0.0.0 --port 8080
 
 ### Lancer via `run.sh` (avec `.env`)
 
-Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`). Utilisez `.env.example` comme modèle.
+Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`). Utilisez `.env.example` comme modèle : les valeurs déjà identiques aux défauts de `app.py` y sont commentées, et il suffit de décommenter ce que vous voulez surcharger.
 
 ```bash
 # Exemple minimal .env
