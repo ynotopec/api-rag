@@ -57,12 +57,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
-CHAT_API_BASE = os.getenv("CHAT_API_BASE", os.getenv("OPENAI_CHAT_API_BASE", OPENAI_API_BASE)).rstrip("/")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "changeme")
-OPENAI_CHAT_COMPLETIONS_URL = CHAT_API_BASE + "/chat/completions"
+OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 UPSTREAM_TIMEOUT_SECONDS = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "60"))
-UPSTREAM_PRESENCE_PENALTY = float(os.getenv("UPSTREAM_PRESENCE_PENALTY", "0.0"))
-UPSTREAM_FREQUENCY_PENALTY = float(os.getenv("UPSTREAM_FREQUENCY_PENALTY", "0.3"))
+DEFAULT_PRESENCE_PENALTY = 0.0
+DEFAULT_FREQUENCY_PENALTY = 0.3
 
 AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "changeme")
 
@@ -659,8 +658,8 @@ def _build_chat_payload(
     if top_p is not None:
         payload["top_p"] = top_p
     if include_penalties:
-        payload["presence_penalty"] = UPSTREAM_PRESENCE_PENALTY
-        payload["frequency_penalty"] = UPSTREAM_FREQUENCY_PENALTY
+        payload["presence_penalty"] = DEFAULT_PRESENCE_PENALTY
+        payload["frequency_penalty"] = DEFAULT_FREQUENCY_PENALTY
     return payload
 
 
@@ -695,7 +694,7 @@ def _summarize_upstream_error(exc: httpx.HTTPError) -> str:
     if isinstance(exc, httpx.ConnectError):
         return (
             f"Unable to connect to upstream chat host '{_chat_upstream_host()}'. "
-            "Check CHAT_API_BASE/OPENAI_CHAT_API_BASE or OPENAI_API_BASE DNS and network settings. "
+            "Check OPENAI_API_BASE DNS and network settings. "
             f"Original error: {exc}"
         )
     return f"Upstream model request failed: {exc}"

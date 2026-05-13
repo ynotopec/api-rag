@@ -163,15 +163,12 @@ sequenceDiagram
 
 | Variable | Défaut | Description |
 | --- | --- | --- |
-| `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible par défaut pour les appels chat, embeddings et reranking. |
-| `CHAT_API_BASE` / `OPENAI_CHAT_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée au chat (optionnelle), suffixée automatiquement par `/chat/completions`; utile si embeddings et chat sont servis par des hôtes différents. |
+| `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible en amont pour le chat, et par défaut pour embeddings/reranking. |
 | `EMBEDDINGS_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée embeddings (optionnelle), suffixée automatiquement par `/embeddings`. |
 | `OPENAI_API_KEY` | `changeme` | Clé API pour l’amont. |
 | `API_AUTH_TOKEN` | *(vide)* | Si défini : **obligatoire** en entrée via `Authorization: Bearer …`. |
 | `UPSTREAM_MODEL_RAG` | `gpt-4o-mini` | Modèle amont pour la génération RAG. |
 | `UPSTREAM_MODEL_REWRITE` | `=UPSTREAM_MODEL_RAG` | Modèle amont pour la réécriture et HyDE. |
-| `UPSTREAM_PRESENCE_PENALTY` | `0.0` | Pénalité de présence envoyée au chat amont; retirée automatiquement au retry si l’amont la rejette. |
-| `UPSTREAM_FREQUENCY_PENALTY` | `0.3` | Pénalité de fréquence envoyée au chat amont; retirée automatiquement au retry si l’amont la rejette. |
 | `MODEL_RAG` | `ai-rag` | Nom logique exposé pour le pipeline RAG. |
 | `VECTORSTORE_DIR` | `vectorstore_db` | Dossier du FAISS sérialisé (persisté sur disque). |
 | `WIKI_TXT` | `wiki.txt` | Corpus brut utilisé pour construire le FAISS si absent. |
@@ -273,7 +270,6 @@ pip install -r requirements.txt
 
 ```bash
 export OPENAI_API_BASE="https://api.openai.com/v1"           # ou votre passerelle vLLM
-# export CHAT_API_BASE="https://chat-gateway.example.com/v1"    # optionnel si le chat est sur un autre hôte
 export OPENAI_API_KEY="sk-..."
 export API_AUTH_TOKEN="my-inbound-token"
 uvicorn app:app --host 0.0.0.0 --port 8080
@@ -281,12 +277,11 @@ uvicorn app:app --host 0.0.0.0 --port 8080
 
 ### Lancer via `run.sh` (avec `.env`)
 
-Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`).
+Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`). Utilisez `.env.example` comme modèle.
 
 ```bash
 # Exemple minimal .env
 OPENAI_API_BASE="https://api.openai.com/v1"
-# CHAT_API_BASE="https://chat-gateway.example.com/v1"  # optionnel si différent de OPENAI_API_BASE
 OPENAI_API_KEY="sk-..."
 API_AUTH_TOKEN="my-inbound-token"
 ```
