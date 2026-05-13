@@ -635,6 +635,30 @@ def _cache_set(cache: "OrderedDict[str, Any]", key: str, value: Any) -> None:
         cache.popitem(last=False)
 
 
+def _normalize_chat_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Return messages with all system instructions merged at the beginning."""
+    system_contents: List[str] = []
+    non_system_messages: List[Dict[str, str]] = []
+
+    for message in messages:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        normalized_message = {"role": role, "content": content}
+        if role == "system":
+            if content:
+                system_contents.append(content)
+        else:
+            non_system_messages.append(normalized_message)
+
+    if not system_contents:
+        return non_system_messages
+
+    return [
+        {"role": "system", "content": "\n\n".join(system_contents)},
+        *non_system_messages,
+    ]
+
+
 def _build_chat_payload(
     messages: List[Dict[str, str]],
     *,
@@ -648,7 +672,7 @@ def _build_chat_payload(
     """Build an OpenAI-compatible chat payload, omitting unset optional fields."""
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _normalize_chat_messages(messages),
         "stream": stream,
     }
     if temperature is not None:
