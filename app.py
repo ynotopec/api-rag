@@ -8,6 +8,7 @@ import pickle
 import logging
 import mailbox
 import email
+from urllib.parse import urlparse
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -59,6 +60,8 @@ OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "changeme")
 OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 UPSTREAM_TIMEOUT_SECONDS = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "60"))
+DEFAULT_PRESENCE_PENALTY = 0.0
+DEFAULT_FREQUENCY_PENALTY = 0.3
 
 AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "changeme")
 
@@ -632,6 +635,121 @@ def _cache_set(cache: "OrderedDict[str, Any]", key: str, value: Any) -> None:
         cache.popitem(last=False)
 
 
+def _normalize_chat_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Return messages with all system instructions merged at the beginning."""
+    system_contents: List[str] = []
+    non_system_messages: List[Dict[str, str]] = []
+
+    for message in messages:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        normalized_message = {"role": role, "content": content}
+        if role == "system":
+            if content:
+                system_contents.append(content)
+        else:
+            non_system_messages.append(normalized_message)
+
+    if not system_contents:
+        return non_system_messages
+
+    return [
+        {"role": "system", "content": "\n\n".join(system_contents)},
+        *non_system_messages,
+    ]
+
+
+def _build_chat_payload(
+    messages: List[Dict[str, str]],
+    *,
+    model: str,
+    temperature: Optional[float],
+    stream: bool,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+    include_penalties: bool = True,
+) -> Dict[str, Any]:
+    """Build an OpenAI-compatible chat payload, omitting unset optional fields."""
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": _normalize_chat_messages(messages),
+        "stream": stream,
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if include_penalties:
+        payload["presence_penalty"] = DEFAULT_PRESENCE_PENALTY
+        payload["frequency_penalty"] = DEFAULT_FREQUENCY_PENALTY
+    return payload
+
+
+def _payload_without_penalties(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy for upstream servers that reject penalty parameters."""
+    stripped = dict(payload)
+    stripped.pop("presence_penalty", None)
+    stripped.pop("frequency_penalty", None)
+    return stripped
+
+
+def _should_retry_without_penalties(exc: httpx.HTTPStatusError, payload: Dict[str, Any]) -> bool:
+    return (
+        exc.response.status_code in {400, 422}
+        and ("presence_penalty" in payload or "frequency_penalty" in payload)
+    )
+
+
+def _chat_upstream_host() -> str:
+    parsed = urlparse(OPENAI_CHAT_COMPLETIONS_URL)
+    return parsed.netloc or OPENAI_CHAT_COMPLETIONS_URL
+
+
+def _summarize_upstream_error(exc: httpx.HTTPError) -> str:
+    """Create a concise, useful upstream error for logs and API responses."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        text = exc.response.text.strip()
+        if len(text) > 500:
+            text = text[:500] + "..."
+        return f"Upstream model request failed with HTTP {status}: {text or exc.response.reason_phrase}"
+    if isinstance(exc, httpx.ConnectError):
+        return (
+            f"Unable to connect to upstream chat host '{_chat_upstream_host()}'. "
+            "Check OPENAI_API_BASE DNS and network settings. "
+            f"Original error: {exc}"
+        )
+    return f"Upstream model request failed: {exc}"
+
+
+def _upstream_error_status(exc: httpx.HTTPError) -> int:
+    if isinstance(exc, httpx.ConnectError):
+        return 503
+    return 502
+
+
+async def _post_upstream_chat_json(
+    client: httpx.AsyncClient,
+    payload: Dict[str, Any],
+    headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Post a non-streaming chat request, retrying for compatibility if needed."""
+    try:
+        resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as exc:
+        if _should_retry_without_penalties(exc, payload):
+            logger.warning("Upstream rejected penalty parameters; retrying chat request without them.")
+            retry_payload = _payload_without_penalties(payload)
+            resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=retry_payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        raise
+
+
 async def _get_http_client() -> Tuple[httpx.AsyncClient, bool]:
     if _http_client is not None:
         return _http_client, False
@@ -641,28 +759,31 @@ async def _get_http_client() -> Tuple[httpx.AsyncClient, bool]:
     ), True
 
 async def _call_upstream_llm(
-    messages: List[Dict[str, str]], 
-    model: str, 
+    messages: List[Dict[str, str]],
+    model: str,
     max_tokens: int = 1000,
     temp: float = 0.1
 ) -> str:
     """Helper to call OpenAI compatible endpoint."""
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temp,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
+    payload = _build_chat_payload(
+        messages,
+        model=model,
+        temperature=temp,
+        stream=False,
+        max_tokens=max_tokens,
+        include_penalties=False,
+    )
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    
+
     client, should_close = await _get_http_client()
     try:
-        resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        data = await _post_upstream_chat_json(client, payload, headers)
+        return data["choices"][0]["message"]["content"]
+    except httpx.HTTPError as e:
+        logger.error(f"LLM Call failed: {_summarize_upstream_error(e)}")
+        return ""
     except Exception as e:
-        logger.error(f"LLM Call failed: {e}")
+        logger.error(f"LLM Call failed while parsing upstream response: {e}")
         return ""
     finally:
         if should_close:
@@ -1021,27 +1142,26 @@ async def chat_endpoint(req: ChatReq):
         )
     else:
         # Sync Call
-        payload = {
-            "model": UPSTREAM_MODEL_RAG,
-            "messages": final_messages,
-            "temperature": req.temperature,
-            "presence_penalty": 0.0,   # Nouveau
-            "frequency_penalty": 0.3,  # <--- AJOUTER CECI (0.3 à 0.5)
-            "stream": False
-        }
+        payload = _build_chat_payload(
+            final_messages,
+            model=UPSTREAM_MODEL_RAG,
+            temperature=req.temperature,
+            stream=False,
+            max_tokens=req.max_tokens,
+            top_p=req.top_p,
+        )
 
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
         client, should_close = await _get_http_client()
         try:
-            resp = await client.post(OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+            data = await _post_upstream_chat_json(client, payload, headers)
         except httpx.TimeoutException:
             logger.error("Upstream chat request timed out.")
             raise HTTPException(status_code=504, detail="Upstream model timeout")
         except httpx.HTTPError as e:
-            logger.error(f"Upstream chat request failed: {e}")
-            raise HTTPException(status_code=502, detail="Upstream model request failed")
+            detail = _summarize_upstream_error(e)
+            logger.error(detail)
+            raise HTTPException(status_code=_upstream_error_status(e), detail=detail)
         finally:
             if should_close:
                 await client.aclose()
@@ -1073,19 +1193,27 @@ async def chat_endpoint(req: ChatReq):
 
 async def _stream_generator(messages, req, sources, chunks, include_chunks: bool, include_citations: bool):
     """Yields SSE events."""
-    payload = {
-        "model": UPSTREAM_MODEL_RAG,
-        "messages": messages,
-        "temperature": req.temperature,
-        "presence_penalty": 0.0,   # Nouveau
-        "frequency_penalty": 0.3,  # <--- AJOUTER CECI
-        "stream": True
-    }
+    payload = _build_chat_payload(
+        messages,
+        model=UPSTREAM_MODEL_RAG,
+        temperature=req.temperature,
+        stream=True,
+        max_tokens=req.max_tokens,
+        top_p=req.top_p,
+    )
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     client, should_close = await _get_http_client()
     streamed_text = ""
-    try:
-        async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=payload, headers=headers) as resp:
+    emitted_upstream_event = False
+    upstream_failed = False
+
+    def sse_error(message: str, error_type: str) -> str:
+        err = {"error": {"message": message, "type": error_type}}
+        return f"data: {json.dumps(err)}\n\n"
+
+    async def emit_stream(stream_payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
+        nonlocal streamed_text, emitted_upstream_event
+        async with client.stream("POST", OPENAI_CHAT_COMPLETIONS_URL, json=stream_payload, headers=headers) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line.startswith("data: ") and line != "data: [DONE]":
@@ -1099,31 +1227,88 @@ async def _stream_generator(messages, req, sources, chunks, include_chunks: bool
                             pass
                         # Clean up model name in response
                         data["model"] = MODEL_RAG_NAME
+                        emitted_upstream_event = True
                         yield f"data: {json.dumps(data)}\n\n"
                     except Exception:
                         pass
+
+    async def emit_non_stream_fallback() -> AsyncGenerator[str, None]:
+        nonlocal streamed_text, emitted_upstream_event
+        fallback_payload = dict(payload)
+        fallback_payload["stream"] = False
+        data = await _post_upstream_chat_json(client, fallback_payload, headers)
+        content = data["choices"][0]["message"].get("content", "")
+        streamed_text += content
+        emitted_upstream_event = True
+        chunk = {
+            "id": data.get("id", f"chatcmpl-{uuid.uuid4()}"),
+            "object": "chat.completion.chunk",
+            "created": data.get("created", int(time.time())),
+            "model": MODEL_RAG_NAME,
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+
+    try:
+        try:
+            async for event in emit_stream(payload):
+                yield event
+        except httpx.HTTPStatusError as exc:
+            if emitted_upstream_event or not _should_retry_without_penalties(exc, payload):
+                raise
+            logger.warning("Upstream rejected penalty parameters; retrying streaming chat request without them.")
+            async for event in emit_stream(_payload_without_penalties(payload)):
+                yield event
     except httpx.TimeoutException:
+        upstream_failed = True
         logger.error("Upstream streaming request timed out.")
-        err = {
-            "error": {
-                "message": "Upstream model timeout",
-                "type": "timeout_error",
-            }
-        }
-        yield f"data: {json.dumps(err)}\n\n"
+        yield sse_error("Upstream model timeout", "timeout_error")
     except httpx.HTTPError as e:
-        logger.error(f"Upstream streaming request failed: {e}")
-        err = {
-            "error": {
-                "message": "Upstream model request failed",
-                "type": "upstream_error",
-            }
-        }
-        yield f"data: {json.dumps(err)}\n\n"
+        if not emitted_upstream_event:
+            try:
+                logger.warning("Upstream streaming request failed before any chunks; retrying once without streaming.")
+                async for event in emit_non_stream_fallback():
+                    yield event
+            except Exception as fallback_exc:
+                upstream_failed = True
+                if isinstance(fallback_exc, httpx.HTTPError):
+                    detail = _summarize_upstream_error(fallback_exc)
+                else:
+                    detail = f"Upstream model request failed: {fallback_exc}"
+                logger.error(detail)
+                yield sse_error(detail, "upstream_error")
+        else:
+            upstream_failed = True
+            detail = _summarize_upstream_error(e)
+            logger.error(detail)
+            yield sse_error(detail, "upstream_error")
+    except Exception as e:
+        if not emitted_upstream_event:
+            try:
+                logger.warning("Upstream stream ended before any chunks; retrying once without streaming.")
+                async for event in emit_non_stream_fallback():
+                    yield event
+            except Exception as fallback_exc:
+                upstream_failed = True
+                detail = (
+                    f"Upstream streaming response ended unexpectedly: {e}; "
+                    f"fallback failed: {fallback_exc}"
+                )
+                logger.error(detail)
+                yield sse_error(detail, "upstream_stream_error")
+        else:
+            upstream_failed = True
+            detail = f"Upstream streaming response ended unexpectedly: {e}"
+            logger.error(detail)
+            yield sse_error(detail, "upstream_stream_error")
     finally:
         if should_close:
             await client.aclose()
-    
+
+    if upstream_failed:
+        yield "data: [DONE]\n\n"
+        return
+
     # Append chunk trace and sources at the end
     if include_chunks:
         chunk_text = _format_chunks_trace(chunks)

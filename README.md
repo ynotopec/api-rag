@@ -163,7 +163,7 @@ sequenceDiagram
 
 | Variable | Défaut | Description |
 | --- | --- | --- |
-| `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible en amont. |
+| `OPENAI_API_BASE` | `http://localhost:8000/v1` | Endpoint OpenAI‑compatible en amont pour le chat, et par défaut pour embeddings/reranking. |
 | `EMBEDDINGS_API_BASE` | `=OPENAI_API_BASE` | Base URL dédiée embeddings (optionnelle), suffixée automatiquement par `/embeddings`. |
 | `OPENAI_API_KEY` | `changeme` | Clé API pour l’amont. |
 | `API_AUTH_TOKEN` | *(vide)* | Si défini : **obligatoire** en entrée via `Authorization: Bearer …`. |
@@ -277,7 +277,7 @@ uvicorn app:app --host 0.0.0.0 --port 8080
 
 ### Lancer via `run.sh` (avec `.env`)
 
-Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`).
+Le script `run.sh` crée un venv dédié, installe les dépendances et lance `uvicorn`. Il **nécessite** un fichier `.env` à la racine avec les variables d’environnement (au minimum `OPENAI_API_BASE` et `OPENAI_API_KEY`). Utilisez `.env.example` comme modèle : les valeurs déjà identiques aux défauts de `app.py` y sont commentées, et il suffit de décommenter ce que vous voulez surcharger.
 
 ```bash
 # Exemple minimal .env
