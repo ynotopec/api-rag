@@ -604,9 +604,11 @@ def _store_extracts(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
     return sources
 
-def check_auth(authorization: str = Header(None)):
+def check_auth(authorization: str = Header(None), x_api_key: str = Header(None)):
+    """Validate the inbound API token using common Bearer or X-API-Key headers."""
     if AUTH_TOKEN:
-        if not authorization or authorization.split(" ", 1)[-1] != AUTH_TOKEN:
+        bearer_token = authorization.split(" ", 1)[-1] if authorization else None
+        if bearer_token != AUTH_TOKEN and x_api_key != AUTH_TOKEN:
             raise HTTPException(401, "Invalid Token")
 
 
