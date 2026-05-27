@@ -60,6 +60,10 @@ OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "changeme")
 OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 UPSTREAM_TIMEOUT_SECONDS = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "60"))
+
+STARTUP_API_WAIT_TIMEOUT_SECONDS = float(os.getenv("STARTUP_API_WAIT_TIMEOUT_SECONDS", "120"))
+STARTUP_API_WAIT_INTERVAL_SECONDS = float(os.getenv("STARTUP_API_WAIT_INTERVAL_SECONDS", "5"))
+
 DEFAULT_PRESENCE_PENALTY = 0.0
 DEFAULT_FREQUENCY_PENALTY = 0.3
 
@@ -164,6 +168,39 @@ class ExternalAPIEmbeddings(Embeddings):
         return self._embed([text])[0]
 
 
+
+
+def _wait_for_required_backends(timeout_seconds: float, interval_seconds: float) -> None:
+    """Block startup until external services required for indexing are reachable."""
+    if EMBEDDING_BACKEND != "external":
+        return
+
+    start = time.time()
+    deadline = start + max(timeout_seconds, 0.0)
+    last_error: Optional[Exception] = None
+
+    while True:
+        try:
+            # Probe embeddings API with a tiny request before index build/update.
+            _get_embeddings().embed_query("startup healthcheck")
+            elapsed = time.time() - start
+            logger.info(f"Embeddings backend is reachable after {elapsed:.1f}s.")
+            return
+        except Exception as exc:
+            last_error = exc
+            if time.time() >= deadline:
+                break
+            logger.warning(
+                "Embeddings backend unavailable during startup (%s). Retrying in %.1fs...",
+                exc,
+                interval_seconds,
+            )
+            time.sleep(max(interval_seconds, 0.1))
+
+    raise RuntimeError(
+        f"Embeddings backend was not reachable within {timeout_seconds:.1f}s: {last_error}"
+    )
+
 # ===============================
 # Lifespan Events
 # ===============================
@@ -187,7 +224,13 @@ async def lifespan(app: FastAPI):
         # Load reranker in background to not block startup entirely
         asyncio.get_event_loop().run_in_executor(_executor, _get_reranker)
 
-    # 4. Load/Build Index
+    # 4. Wait for required external backends and then load/build index
+    await asyncio.get_event_loop().run_in_executor(
+        _executor,
+        _wait_for_required_backends,
+        STARTUP_API_WAIT_TIMEOUT_SECONDS,
+        STARTUP_API_WAIT_INTERVAL_SECONDS,
+    )
     await asyncio.get_event_loop().run_in_executor(_executor, _ensure_vectorstore)
 
     if INGESTION_REFRESH_INTERVAL > 0:
