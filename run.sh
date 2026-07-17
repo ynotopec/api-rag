@@ -1,48 +1,50 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-serverAddress=$1
-portNumber=$2
+SERVER_ADDRESS="${1:-${HOST:-${SERVER_NAME:-0.0.0.0}}}"
+PORT_NUMBER="${2:-${PORT:-${SERVER_PORT:-8080}}}"
 
-pythonVersion=python3
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_NAME="$(basename "${PROJECT_DIR}")"
+VENV_DIR="${VENV_DIR:-${HOME}/venv/${PROJECT_NAME}}"
+PYTHON_BIN="${VENV_DIR}/bin/python"
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-pythonDir=~/"venv/$(basename "${DIR}")"
-cd $DIR
+cd "${PROJECT_DIR}"
 
-deactivate 2>/dev/null
-mkdir -p "${pythonDir}"
-${pythonVersion} -m venv "${pythonDir}"
-source "${pythonDir}"/bin/activate
-
-#intall
-#${pythonVersion} -m pip cache purge ; ${pythonVersion} -m pip install -U pip wheel ; ${pythonVersion} -m pip install -U -r requirements.txt
-#optimize space
-#(jdupes -X size+:99M -r -L ~ >/dev/null 2>&1 )&
-
-export HF_HUB_DISABLE_TELEMETRY=1
-if [ ! -z "${serverAddress}" ] ;then
-  export GRADIO_SERVER_NAME="${serverAddress}"
-  export SERVER_NAME="${serverAddress}"
+if [ ! -x "${PYTHON_BIN}" ]; then
+  "${PROJECT_DIR}/install.sh"
 fi
-if [ ! -z "${portNumber}" ] ;then
-  export GRADIO_SERVER_PORT="${portNumber}"
-  export SERVER_PORT="${portNumber}"
-  export BACK_PORT=$((SERVER_PORT + 1))
-fi
-export CUDA_LAUNCH_BLOCKING=1
 
-# Charger les variables d'environnement depuis .env
-if [ -f ".env" ]; then
-#  export $(grep -v '^#' .env | xargs)
+# Load environment for both interactive shells and systemd ExecStart.
+if [ -f "${PROJECT_DIR}/.env" ]; then
   set -a
-  source .env
+  # shellcheck disable=SC1091
+  source "${PROJECT_DIR}/.env"
   set +a
-else
-  echo ".env file not found!"
-  exit 1
 fi
 
-#${pythonVersion} app.py $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-#${pythonVersion} -m streamlit run app.py --browser.gatherUsageStats false $([ ! -z "${serverAddress}" ] && echo --server.address ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --server.port ${portNumber})
-${pythonVersion} -m uvicorn app:app $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-#${pythonVersion} back.py
+# Positional arguments intentionally override .env for systemd templates and shell use.
+export HOST="${SERVER_ADDRESS}"
+export PORT="${PORT_NUMBER}"
+export SERVER_NAME="${SERVER_ADDRESS}"
+export SERVER_PORT="${PORT_NUMBER}"
+
+# Safe accelerator defaults for CPU, NVIDIA H100, and NVIDIA DGX Spark-class systems.
+export HF_HUB_DISABLE_TELEMETRY="${HF_HUB_DISABLE_TELEMETRY:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+UVICORN_ARGS=(app:app --host "${HOST}" --port "${PORT}")
+if [ -n "${UVICORN_WORKERS:-}" ]; then
+  UVICORN_ARGS+=(--workers "${UVICORN_WORKERS}")
+fi
+if [ -n "${UVICORN_LOG_LEVEL:-}" ]; then
+  UVICORN_ARGS+=(--log-level "${UVICORN_LOG_LEVEL}")
+fi
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  exec "${PYTHON_BIN}" -m uvicorn "${UVICORN_ARGS[@]}"
+else
+  "${PYTHON_BIN}" -m uvicorn "${UVICORN_ARGS[@]}"
+fi
