@@ -6,6 +6,13 @@ import hashlib
 import asyncio
 import pickle
 import logging
+
+# FAISS probes optional CPU-specific extension modules at import time and logs
+# informational fallback messages when they are unavailable. Keep those expected
+# fallback notices out of the application log while preserving warnings/errors.
+logging.getLogger("faiss.loader").setLevel(logging.WARNING)
+logging.getLogger("faiss").setLevel(logging.WARNING)
+
 import mailbox
 import email
 from urllib.parse import urlparse
