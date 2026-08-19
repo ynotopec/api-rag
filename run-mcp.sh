@@ -1,35 +1,32 @@
 #!/usr/bin/env bash
+# Run the api-rag MCP server — one command.
+#   ./run-mcp.sh              → stdio (Hermes config.yaml)
+#   ./run-mcp.sh --sse        → HTTP/SSE (OpenWebUI / any client)
+#
+# Required env:  RAG_API_URL   (default http://localhost:8080)
+#                RAG_AUTH_TOKEN (default changeme)
+# Optional env:  MCP_PORT       (default 8085)
+
 set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_NAME="api-rag"
-VENV_DIR="${VENV_DIR:-${HOME}/venv/${PROJECT_NAME}}"
-PYTHON_BIN="${VENV_DIR}/bin/python"
-
-cd "${PROJECT_DIR}"
-
-if [ ! -x "${PYTHON_BIN}" ]; then
-  "${PROJECT_DIR}/install.sh"
+VENV="${VENV_DIR:-${HOME}/venv/api-rag}/bin/python"
+if [ ! -x "$VENV" ]; then
+  ./install.sh >/dev/null 2>&1 || true
 fi
 
-# Activate venv so mcp and uvicorn are on PATH
-export PATH="${VENV_DIR}/bin:${PATH}"
+# Load .env if present
+[ -f .env ] && set -a && source .env && set +a
 
-# Load environment (API auth token, upstream config)
-if [ -f "${PROJECT_DIR}/.env" ]; then
-  set -a
-  source "${PROJECT_DIR}/.env"
-  set +a
-fi
-
-# MCP defaults
-export MCP_HOST="${MCP_HOST:-0.0.0.0}"
-export MCP_PORT="${MCP_PORT:-8085}"
+# Defaults
 export RAG_API_URL="${RAG_API_URL:-http://localhost:8080}"
-export RAG_AUTH_TOKEN="${RAG_AUTH_TOKEN:-${API_AUTH_TOKEN:-changeme}}"
+export RAG_AUTH_TOKEN="${RAG_AUTH_TOKEN:-changeme}"
+export MCP_PORT="${MCP_PORT:-8085}"
 
-exec "${PYTHON_BIN}" -m uvicorn \
-  mcp_wrapper.main:app \
-  --host "${MCP_HOST}" \
-  --port "${MCP_PORT}" \
-  --log-level "${UVICORN_LOG_LEVEL:-info}"
+# Detect mode
+if [[ "${1:-}" == "--sse" ]]; then
+  exec "$VENV" -m uvicorn "mcp_wrapper.main:_create_app" \
+    --factory --host 0.0.0.0 --port "${MCP_PORT}" --log-level info
+else
+  exec "$VENV" -m mcp_wrapper.main
+fi
