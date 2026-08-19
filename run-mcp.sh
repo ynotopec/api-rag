@@ -29,7 +29,7 @@ export RAG_API_URL="${RAG_API_URL:-http://localhost:8080}"
 export RAG_AUTH_TOKEN="${RAG_AUTH_TOKEN:-${API_AUTH_TOKEN:-changeme}}"
 
 exec "${PYTHON_BIN}" -m uvicorn \
-  mcp_server.main:app \
+  mcp_wrapper.main:app \
   --host "${MCP_HOST}" \
   --port "${MCP_PORT}" \
   --log-level "${UVICORN_LOG_LEVEL:-info}"

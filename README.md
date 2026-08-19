@@ -4,7 +4,7 @@ Minimal OpenAI-compatible RAG API with token auth and MCP server.
 
 ## MCP Server
 
-A `mcp_server/` subdirectory wraps the RAG API as an MCP server so other agents and tools can call it programmatically.
+A `mcp_wrapper/` subdirectory wraps the RAG API as an MCP server so other agents and tools can call it programmatically.
 
 ### Tools exposed
 
