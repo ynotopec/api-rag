@@ -1,6 +1,63 @@
 # api-rag
 
-Minimal OpenAI-compatible RAG API with token auth.
+Minimal OpenAI-compatible RAG API with token auth and MCP server.
+
+## MCP Server
+
+A `mcp_server/` subdirectory wraps the RAG API as an MCP server so other agents and tools can call it programmatically.
+
+### Tools exposed
+
+| Tool | Description |
+|------|-------------|
+| `rag_chat` | Query the RAG knowledge base via `/v1/chat/completions` |
+| `rag_health` | Health check — returns status and vector count |
+| `rag_list_models` | List available RAG models |
+| `rag_get_extract` | Retrieve a stored source extract by ID |
+
+### Configuration
+
+```bash
+# Point to your RAG service
+export RAG_API_URL=http://localhost:8080
+
+# Auth token for the RAG service (falls back to API_AUTH_TOKEN)
+export RAG_AUTH_TOKEN=your-token-here
+
+# SSE mode only (default for stdio)
+export MCP_HOST=0.0.0.0
+export MCP_PORT=8085
+```
+
+### Running
+
+```bash
+# Stdio transport (default — used by Hermes config.yaml)
+source run-mcp.sh
+
+# HTTP/SSE transport (for OpenWebUI or remote clients)
+source run-mcp.sh --sse
+```
+
+### Hermes config.yaml integration
+
+Add to your `~/.hermes/config.yaml` under `mcp_servers`:
+
+```yaml
+mcp_servers:
+  api-rag:
+    command: "bash"
+    args: ["/home/ai-agent/work/api-rag/run-mcp.sh"]
+    env:
+      RAG_API_URL: "http://localhost:8080"
+      RAG_AUTH_TOKEN: "your-token"
+```
+
+Tools will be registered as `mcp_api_rag_rag_chat`, `mcp_api_rag_rag_health`, etc.
+
+### OpenWebUI integration
+
+Run with `--sse` and add the SSE endpoint URL to OpenWebUI → Admin → Integrations → MCP Servers.
 
 ## Start
 
