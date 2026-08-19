@@ -1,0 +1,4 @@
+# MCP server dependencies for api-rag
+# Install alongside the main api-rag requirements:
+#   pip install -r requirements.txt -r requirements-mcp.txt
+mcp>=2.0.0
