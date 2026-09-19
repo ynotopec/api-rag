@@ -81,6 +81,11 @@ MODEL_RAG=ai-rag
 
 Copy `.env.example` for the important optional defaults.
 
+Unless overridden, responses omit chunks, structured citations, and the plain
+source footer. These request defaults can be changed globally with
+`DEFAULT_INCLUDE_CHUNKS`, `DEFAULT_INCLUDE_CITATIONS`, and
+`DEFAULT_INCLUDE_SOURCES`.
+
 ## API
 
 Popular OpenAI-compatible endpoints:
@@ -113,7 +118,7 @@ For multiple files or directories, set:
 
 ```bash
 INGESTION_TEXT_PATHS=docs,README.md
-RAG_FORCE_REBUILD=false
+RAG_FORCE_REBUILD=true
 ```
 
 Documents are split hierarchically: small chunks are stored in the FAISS and
@@ -122,10 +127,10 @@ BM25 indexes for precise matching, while each large parent is stored once in
 context for complete procedures. The sizes and overlaps are configurable:
 
 ```bash
-CHUNK_BIG_SIZE=2000
-CHUNK_SMALL_SIZE=800
-CHUNK_BIG_OVERLAP=200
-CHUNK_SMALL_OVERLAP=100
+CHUNK_BIG_SIZE=4000
+CHUNK_SMALL_SIZE=500
+CHUNK_BIG_OVERLAP=0
+CHUNK_SMALL_OVERLAP=0
 ```
 
 `CHUNK_SMALL_SIZE` must not exceed `CHUNK_BIG_SIZE`, and each overlap must be
@@ -139,11 +144,12 @@ versions, and error codes:
 
 ```bash
 ENABLE_HYBRID_SEARCH=true
-BM25_K=4
+BM25_K=6
 ```
 
 Set `ENABLE_HYBRID_SEARCH=false` only when dense-only retrieval is desired.
-Reranking remains optional and is disabled by default.
+Reranking is enabled by default with the external
+`BAAI/bge-reranker-v2-m3` model.
 
 ## H100 / DGX Spark notes
 
