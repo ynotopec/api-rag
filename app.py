@@ -98,14 +98,20 @@ RAG_QUERY_STRATEGY = os.getenv("RAG_QUERY_STRATEGY", "rewrite+hyde")
 HISTORY_WINDOW = int(os.getenv("RAG_HISTORY_WINDOW", "6"))
 
 # Optimization Flags
-ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "false").lower() == "true"
+# Dense retrieval alone can miss exact identifiers (variables, paths, error
+# codes). BM25 is therefore enabled by default and fused with dense results.
+ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
 ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "false").lower() == "true"
 ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "true").lower() == "true"
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
 
-# Chunking
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+# Hierarchical chunking. Small chunks are embedded for precise retrieval, while
+# their big parent chunks are sent to the generation model for richer context.
+# CHUNK_SIZE remains a compatibility fallback for existing deployments.
+CHUNK_BIG_SIZE = int(os.getenv("CHUNK_BIG_SIZE", "2000"))
+CHUNK_SMALL_SIZE = int(os.getenv("CHUNK_SMALL_SIZE", os.getenv("CHUNK_SIZE", "800")))
+CHUNK_BIG_OVERLAP = int(os.getenv("CHUNK_BIG_OVERLAP", "200"))
+CHUNK_SMALL_OVERLAP = int(os.getenv("CHUNK_SMALL_OVERLAP", os.getenv("CHUNK_OVERLAP", "100")))
 
 # Retrieval Settings
 MMR_K = int(os.getenv("MMR_K", "8"))
@@ -132,6 +138,7 @@ PORT = int(os.getenv("PORT", "8080"))
 _vector: Optional[FAISS] = None
 _bm25_retriever: Optional[BM25Retriever] = None
 _all_docs: List[Document] = []
+_parent_docs: Dict[str, Document] = {}
 _embeddings: Optional[HuggingFaceEmbeddings] = None
 _reranker: Optional[Any] = None
 _http_client: Optional[httpx.AsyncClient] = None
@@ -317,16 +324,36 @@ def _get_reranker():
         return None
 
 
+def _chunking_config() -> Dict[str, int]:
+    return {
+        "chunk_big_size": CHUNK_BIG_SIZE,
+        "chunk_small_size": CHUNK_SMALL_SIZE,
+        "chunk_big_overlap": CHUNK_BIG_OVERLAP,
+        "chunk_small_overlap": CHUNK_SMALL_OVERLAP,
+    }
+
+
 def _ensure_vectorstore():
-    global _vector, _bm25_retriever, _all_docs, _last_ingestion_mtime
+    global _vector, _bm25_retriever, _all_docs, _parent_docs, _last_ingestion_mtime
     
     index_path = os.path.join(VECTORSTORE_DIR, "index.faiss")
     chunks_path = os.path.join(VECTORSTORE_DIR, "chunks.pkl")
+    parents_path = os.path.join(VECTORSTORE_DIR, "parents.pkl")
+    config_path = os.path.join(VECTORSTORE_DIR, "chunking.json")
     
     rebuild = RAG_FORCE_REBUILD
-    if not os.path.exists(index_path) or not os.path.exists(chunks_path):
+    required_paths = (index_path, chunks_path, parents_path, config_path)
+    if not all(os.path.exists(path) for path in required_paths):
         rebuild = True
     else:
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                stored_config = json.load(config_file)
+            if stored_config != _chunking_config():
+                logger.info("Chunking configuration changed, rebuilding index...")
+                rebuild = True
+        except (OSError, ValueError):
+            rebuild = True
         ingestion_mtime = _get_ingestion_latest_mtime()
         _last_ingestion_mtime = ingestion_mtime
         if ingestion_mtime and ingestion_mtime > os.path.getmtime(VECTORSTORE_DIR):
@@ -342,6 +369,8 @@ def _ensure_vectorstore():
             _vector = FAISS.load_local(VECTORSTORE_DIR, _get_embeddings(), allow_dangerous_deserialization=True)
             with open(chunks_path, "rb") as f:
                 _all_docs = pickle.load(f)
+            with open(parents_path, "rb") as f:
+                _parent_docs = pickle.load(f)
             
             if ENABLE_HYBRID_SEARCH and _all_docs:
                 _bm25_retriever = BM25Retriever.from_documents(_all_docs)
@@ -352,18 +381,14 @@ def _ensure_vectorstore():
 
 
 def _build_index():
-    global _vector, _bm25_retriever, _all_docs, _last_ingestion_mtime
+    global _vector, _bm25_retriever, _all_docs, _parent_docs, _last_ingestion_mtime
     docs = _collect_ingestion_documents()
     if not docs:
         logger.warning("No ingestion documents found. Creating empty index.")
         docs = [Document(page_content="Welcome to the RAG system.", metadata={"source": "system"})]
+        parent_docs = {}
     else:
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        docs = splitter.split_documents(docs)
+        docs, parent_docs = _split_documents_hierarchically(docs)
 
     embeddings = _get_embeddings()
     _vector = FAISS.from_documents(docs, embeddings)
@@ -372,11 +397,68 @@ def _build_index():
     _all_docs = docs
     with open(os.path.join(VECTORSTORE_DIR, "chunks.pkl"), "wb") as f:
         pickle.dump(docs, f)
+    _parent_docs = parent_docs
+    with open(os.path.join(VECTORSTORE_DIR, "parents.pkl"), "wb") as f:
+        pickle.dump(parent_docs, f)
+    with open(os.path.join(VECTORSTORE_DIR, "chunking.json"), "w", encoding="utf-8") as f:
+        json.dump(_chunking_config(), f, indent=2, sort_keys=True)
         
     if ENABLE_HYBRID_SEARCH:
         _bm25_retriever = BM25Retriever.from_documents(docs)
         _bm25_retriever.k = BM25_K
     _last_ingestion_mtime = _get_ingestion_latest_mtime()
+
+
+def _split_documents_hierarchically(
+    docs: List[Document],
+) -> Tuple[List[Document], Dict[str, Document]]:
+    """Create searchable small chunks linked to their larger context chunks."""
+    if CHUNK_SMALL_SIZE > CHUNK_BIG_SIZE:
+        raise ValueError("CHUNK_SMALL_SIZE must be less than or equal to CHUNK_BIG_SIZE")
+    if not 0 <= CHUNK_BIG_OVERLAP < CHUNK_BIG_SIZE:
+        raise ValueError("CHUNK_BIG_OVERLAP must be non-negative and smaller than CHUNK_BIG_SIZE")
+    if not 0 <= CHUNK_SMALL_OVERLAP < CHUNK_SMALL_SIZE:
+        raise ValueError("CHUNK_SMALL_OVERLAP must be non-negative and smaller than CHUNK_SMALL_SIZE")
+
+    separators = ["\n\n", "\n", ". ", " ", ""]
+    big_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_BIG_SIZE,
+        chunk_overlap=CHUNK_BIG_OVERLAP,
+        separators=separators,
+        add_start_index=True,
+    )
+    small_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SMALL_SIZE,
+        chunk_overlap=CHUNK_SMALL_OVERLAP,
+        separators=separators,
+        add_start_index=True,
+    )
+
+    small_chunks: List[Document] = []
+    parent_docs: Dict[str, Document] = {}
+    for big_index, big_chunk in enumerate(big_splitter.split_documents(docs)):
+        source = str(big_chunk.metadata.get("source", "unknown"))
+        start_index = big_chunk.metadata.get("start_index", 0)
+        parent_id = hashlib.sha256(
+            f"{source}:{start_index}:{big_chunk.page_content}".encode("utf-8")
+        ).hexdigest()
+        parent_metadata = {
+            "parent_chunk_id": parent_id,
+            "parent_chunk_index": big_index,
+            "parent_start_index": start_index,
+        }
+        parent_docs[parent_id] = big_chunk
+        for small_chunk in small_splitter.split_documents([big_chunk]):
+            small_chunk.metadata.update(parent_metadata)
+            small_chunks.append(small_chunk)
+
+    logger.info(
+        "Hierarchical chunking created %d searchable small chunks (big=%d, small=%d).",
+        len(small_chunks),
+        CHUNK_BIG_SIZE,
+        CHUNK_SMALL_SIZE,
+    )
+    return small_chunks, parent_docs
 
 
 async def _refresh_index_loop():
@@ -985,6 +1067,34 @@ def _rerank_documents(query: str, docs: List[Document]) -> List[Document]:
         return docs
 
 
+def _expand_parent_chunks(docs: List[Document]) -> List[Document]:
+    """Resolve unique parent contexts after small-chunk retrieval and reranking."""
+    expanded: List[Document] = []
+    seen: Set[str] = set()
+    for doc in docs:
+        parent_id = doc.metadata.get("parent_chunk_id")
+        parent_doc = _parent_docs.get(parent_id) if parent_id else None
+        if parent_doc is None:
+            identity = hashlib.sha256(doc.page_content.encode("utf-8")).hexdigest()
+            parent_content = doc.page_content
+            parent_id = identity
+            parent_metadata = dict(doc.metadata)
+        else:
+            parent_content = parent_doc.page_content
+            parent_metadata = dict(parent_doc.metadata)
+        if parent_id in seen:
+            continue
+        seen.add(parent_id)
+        metadata = parent_metadata
+        metadata["parent_chunk_id"] = parent_id
+        metadata["matched_small_chunk"] = doc.page_content
+        for score_key in ("_retrieval_score", "_retrieval_confidence"):
+            if score_key in doc.metadata:
+                metadata[score_key] = doc.metadata[score_key]
+        expanded.append(Document(page_content=parent_content, metadata=metadata))
+    return expanded
+
+
 # ===============================
 # Logic: Main Retrieval Pipeline
 # ===============================
@@ -1078,10 +1188,14 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
         
         # Fast Dedup
         deduped = _fast_deduplicate(fused)
-        
-        # Rerank (Heavy)
-        final_docs = _rerank_documents(rewritten_query, deduped)
-        return final_docs[:RAG_TOP_K]
+
+        # Rank precise small matches first. Expanding before reranking would
+        # dilute exact variables and commands inside their larger procedures.
+        ranked_small_docs = _rerank_documents(rewritten_query, deduped)
+
+        # Add parent context only after ranking, then collapse sibling matches.
+        expanded = _expand_parent_chunks(ranked_small_docs)
+        return expanded[:RAG_TOP_K]
 
     final_docs = await asyncio.get_event_loop().run_in_executor(_executor, process_results)
 
@@ -1095,7 +1209,13 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
     for i, doc in enumerate(final_docs):
         # Petit nettoyage : retirer les sauts de ligne excessifs dans le chunk lui-même
         clean_content = " ".join(doc.page_content.split())
-        formatted_chunks.append(f"[Excerpt {i+1}]: {clean_content}")
+        matched_content = " ".join(
+            str(doc.metadata.get("matched_small_chunk", doc.page_content)).split()
+        )
+        formatted_chunks.append(
+            f"[Excerpt {i+1} - precise match]: {matched_content}\n"
+            f"[Excerpt {i+1} - parent context]: {clean_content}"
+        )
         chunks_trace.append(
             {
                 "rank": i + 1,
@@ -1105,6 +1225,7 @@ async def _retrieve_pipeline(messages: List[ChatMessage]) -> Dict[str, Any]:
                 "score": doc.metadata.get("_retrieval_score", None),
                 "confidence": doc.metadata.get("_retrieval_confidence", None),
                 "excerpt": clean_content,
+                "matched_excerpt": matched_content,
             }
         )
 

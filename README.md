@@ -116,6 +116,35 @@ INGESTION_TEXT_PATHS=docs,README.md
 RAG_FORCE_REBUILD=false
 ```
 
+Documents are split hierarchically: small chunks are stored in the FAISS and
+BM25 indexes for precise matching, while each large parent is stored once in
+`parents.pkl`. Small results are ranked first and then expanded to their parent
+context for complete procedures. The sizes and overlaps are configurable:
+
+```bash
+CHUNK_BIG_SIZE=2000
+CHUNK_SMALL_SIZE=800
+CHUNK_BIG_OVERLAP=200
+CHUNK_SMALL_OVERLAP=100
+```
+
+`CHUNK_SMALL_SIZE` must not exceed `CHUNK_BIG_SIZE`, and each overlap must be
+smaller than its corresponding chunk size. The legacy `CHUNK_SIZE` and
+`CHUNK_OVERLAP` variables remain supported as fallbacks for the small chunks.
+Changing a chunk setting automatically rebuilds an existing index.
+
+Hybrid dense/lexical retrieval is enabled by default. BGE-M3 handles semantic
+matches while BM25 improves exact matching for variables, commands, paths,
+versions, and error codes:
+
+```bash
+ENABLE_HYBRID_SEARCH=true
+BM25_K=4
+```
+
+Set `ENABLE_HYBRID_SEARCH=false` only when dense-only retrieval is desired.
+Reranking remains optional and is disabled by default.
+
 ## H100 / DGX Spark notes
 
 For accelerator servers, keep embedding and reranking behind your OpenAI-compatible backend (for example vLLM) when possible:
