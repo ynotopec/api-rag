@@ -81,6 +81,12 @@ UPSTREAM_MODEL_RAG = os.getenv("UPSTREAM_MODEL_RAG", "gpt-4o-mini")
 UPSTREAM_MODEL_REWRITE = os.getenv("UPSTREAM_MODEL_REWRITE", UPSTREAM_MODEL_RAG)
 MODEL_RAG_NAME = os.getenv("MODEL_RAG", "ai-rag")
 
+# Response enrichment defaults. Individual requests can still override these
+# values by explicitly setting the corresponding fields.
+DEFAULT_INCLUDE_CHUNKS = os.getenv("DEFAULT_INCLUDE_CHUNKS", "false").lower() in {"1", "true", "yes"}
+DEFAULT_INCLUDE_CITATIONS = os.getenv("DEFAULT_INCLUDE_CITATIONS", "false").lower() in {"1", "true", "yes"}
+DEFAULT_INCLUDE_SOURCES = os.getenv("DEFAULT_INCLUDE_SOURCES", "false").lower() in {"1", "true", "yes"}
+
 # Vector Store
 VECTORSTORE_DIR = os.getenv("VECTORSTORE_DIR", "vectorstore_db")
 WIKI_PATH = os.getenv("WIKI_TXT", "wiki.txt")
@@ -92,7 +98,7 @@ THUNDERBIRD_MAX_MESSAGES = int(os.getenv("THUNDERBIRD_MAX_MESSAGES", "10000"))
 INGESTION_REFRESH_INTERVAL = int(os.getenv("INGESTION_REFRESH_INTERVAL", "0"))
 
 # RAG Params
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "12"))
 # Strategies: "simple", "rewrite", "hyde", "rewrite+hyde"
 RAG_QUERY_STRATEGY = os.getenv("RAG_QUERY_STRATEGY", "rewrite+hyde")
 HISTORY_WINDOW = int(os.getenv("RAG_HISTORY_WINDOW", "6"))
@@ -101,22 +107,22 @@ HISTORY_WINDOW = int(os.getenv("RAG_HISTORY_WINDOW", "6"))
 # Dense retrieval alone can miss exact identifiers (variables, paths, error
 # codes). BM25 is therefore enabled by default and fused with dense results.
 ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
-ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "false").lower() == "true"
+ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
 ENABLE_QUERY_CLASSIFICATION = os.getenv("ENABLE_QUERY_CLASSIFICATION", "true").lower() == "true"
 ENABLE_CACHING = os.getenv("ENABLE_CACHING", "true").lower() == "true"
 
 # Hierarchical chunking. Small chunks are embedded for precise retrieval, while
 # their big parent chunks are sent to the generation model for richer context.
 # CHUNK_SIZE remains a compatibility fallback for existing deployments.
-CHUNK_BIG_SIZE = int(os.getenv("CHUNK_BIG_SIZE", "2000"))
-CHUNK_SMALL_SIZE = int(os.getenv("CHUNK_SMALL_SIZE", os.getenv("CHUNK_SIZE", "800")))
-CHUNK_BIG_OVERLAP = int(os.getenv("CHUNK_BIG_OVERLAP", "200"))
-CHUNK_SMALL_OVERLAP = int(os.getenv("CHUNK_SMALL_OVERLAP", os.getenv("CHUNK_OVERLAP", "100")))
+CHUNK_BIG_SIZE = int(os.getenv("CHUNK_BIG_SIZE", "4000"))
+CHUNK_SMALL_SIZE = int(os.getenv("CHUNK_SMALL_SIZE", os.getenv("CHUNK_SIZE", "500")))
+CHUNK_BIG_OVERLAP = int(os.getenv("CHUNK_BIG_OVERLAP", "0"))
+CHUNK_SMALL_OVERLAP = int(os.getenv("CHUNK_SMALL_OVERLAP", os.getenv("CHUNK_OVERLAP", "0")))
 
 # Retrieval Settings
 MMR_K = int(os.getenv("MMR_K", "8"))
 MMR_FETCH_K = int(os.getenv("MMR_FETCH_K", "16"))
-BM25_K = int(os.getenv("BM25_K", "4"))
+BM25_K = int(os.getenv("BM25_K", "6"))
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 RERANKING_BACKEND = os.getenv("RERANKING_BACKEND", "external").strip().lower()
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "external").strip().lower()
@@ -639,9 +645,9 @@ class ChatReq(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.2
     stream: Optional[bool] = False
-    include_chunks: Optional[bool] = False
-    include_citations: Optional[bool] = False
-    include_sources: Optional[bool] = False
+    include_chunks: Optional[bool] = DEFAULT_INCLUDE_CHUNKS
+    include_citations: Optional[bool] = DEFAULT_INCLUDE_CITATIONS
+    include_sources: Optional[bool] = DEFAULT_INCLUDE_SOURCES
     max_tokens: Optional[int] = None
     top_p: Optional[float] = 1.0
 

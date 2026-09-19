@@ -28,6 +28,11 @@ import os
 import json
 import httpx
 
+MODEL_RAG = os.getenv("MODEL_RAG", "ai-rag")
+DEFAULT_INCLUDE_CHUNKS = os.getenv("DEFAULT_INCLUDE_CHUNKS", "false").lower() in {"1", "true", "yes"}
+DEFAULT_INCLUDE_CITATIONS = os.getenv("DEFAULT_INCLUDE_CITATIONS", "false").lower() in {"1", "true", "yes"}
+DEFAULT_INCLUDE_SOURCES = os.getenv("DEFAULT_INCLUDE_SOURCES", "false").lower() in {"1", "true", "yes"}
+
 from mcp.server import Server
 from mcp.server.context import ServerRequestContext
 from mcp.server.sse import SseServerTransport
@@ -90,7 +95,7 @@ TOOLS: list[Tool] = [
                 "model": {
                     "type": "string",
                     "description": "Model name (defaults to 'ai-rag').",
-                    "default": "ai-rag",
+                    "default": MODEL_RAG,
                 },
                 "temperature": {
                     "type": "number",
@@ -110,17 +115,17 @@ TOOLS: list[Tool] = [
                 "include_chunks": {
                     "type": "boolean",
                     "description": "Append the list of source chunks used for the answer.",
-                    "default": False,
+                    "default": DEFAULT_INCLUDE_CHUNKS,
                 },
                 "include_citations": {
                     "type": "boolean",
                     "description": "Include structured citation objects with source excerpts and scores.",
-                    "default": False,
+                    "default": DEFAULT_INCLUDE_CITATIONS,
                 },
                 "include_sources": {
                     "type": "boolean",
                     "description": "Append a plain-text 'Sources: …' footer.",
-                    "default": False,
+                    "default": DEFAULT_INCLUDE_SOURCES,
                 },
                 "stream": {
                     "type": "boolean",
@@ -168,13 +173,13 @@ TOOLS: list[Tool] = [
 
 async def _handle_rag_chat(args: dict) -> str:
     """Call POST /v1/chat/completions on the RAG service."""
-    model: str = args.get("model", "ai-rag")
+    model: str = args.get("model", MODEL_RAG)
     temperature: float = args.get("temperature", 0.2)
     top_p: float = args.get("top_p", 1.0)
     max_tokens: int | None = args.get("max_tokens")
-    include_chunks: bool = args.get("include_chunks", False)
-    include_citations: bool = args.get("include_citations", False)
-    include_sources: bool = args.get("include_sources", False)
+    include_chunks: bool = args.get("include_chunks", DEFAULT_INCLUDE_CHUNKS)
+    include_citations: bool = args.get("include_citations", DEFAULT_INCLUDE_CITATIONS)
+    include_sources: bool = args.get("include_sources", DEFAULT_INCLUDE_SOURCES)
     stream: bool = args.get("stream", False)
     query: str = args.get("query", "")
 
